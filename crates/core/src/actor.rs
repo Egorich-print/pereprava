@@ -656,7 +656,10 @@ impl ActorState {
                     Err(e) => Err(e),
                 };
                 if out.is_ok() {
-                    let sid = self.storage(storage_index).map(|s| s.id.0 as u32).unwrap_or(0);
+                    let sid = self
+                        .storage(storage_index)
+                        .map(|s| s.id.0 as u32)
+                        .unwrap_or(0);
                     self.cache.invalidate(sid, 0, None);
                 }
                 let _ = reply.send(out);
@@ -703,7 +706,10 @@ impl ActorState {
                     Err(e) => Err(e),
                 };
                 if out.is_ok() {
-                    let sid = self.storage(storage_index).map(|s| s.id.0 as u32).unwrap_or(0);
+                    let sid = self
+                        .storage(storage_index)
+                        .map(|s| s.id.0 as u32)
+                        .unwrap_or(0);
                     self.cache.invalidate(sid, parent.0, None);
                 }
                 let _ = reply.send(out);
@@ -716,8 +722,10 @@ impl ActorState {
                 to_name,
                 reply,
             } => {
-                let _ = reply
-                    .send(self.rename_handle(storage_index, from_parent, &from_name, to_parent, &to_name).await);
+                let _ = reply.send(
+                    self.rename_handle(storage_index, from_parent, &from_name, to_parent, &to_name)
+                        .await,
+                );
             }
             Request::Storages { reply } => {
                 let _ = reply.send(Ok(self
@@ -1158,7 +1166,8 @@ impl ActorState {
                 .move_object(ObjectHandle(src.handle), to_parent, Some(sid))
                 .await
                 .map_err(Error::mtp_msg)?;
-            self.cache.invalidate(sid.0 as u32, from_parent.0, Some(src.handle));
+            self.cache
+                .invalidate(sid.0 as u32, from_parent.0, Some(src.handle));
             self.cache.invalidate(sid.0 as u32, to_parent.0, None);
         }
 

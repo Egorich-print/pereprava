@@ -10,15 +10,17 @@ use pereprava_nfs::MtpNfs;
 ///
 /// With `serve_only` the NFS server runs without invoking `mount_nfs`
 /// (protocol debugging / tests that cannot gain root).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     path: PathBuf,
     port: u16,
     serve_only: bool,
     allow_unprivileged_source_port: bool,
     export: String,
+    read_only: bool,
 ) -> Result<()> {
     let dev = super::commands::connect().await?;
-    let nfs = MtpNfs::new(dev.clone())
+    let nfs = MtpNfs::new(dev.clone(), !read_only)
         .await
         .context("building the NFS view of the device")?;
 

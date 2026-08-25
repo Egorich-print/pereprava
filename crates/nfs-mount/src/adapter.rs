@@ -12,20 +12,46 @@
 //! Android MTP handles fit well below 2^48, so the packing is lossless in
 //! practice; `decode()` rejects anything else with NFS3ERR_BADHANDLE.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
 use fernfs::protocol::xdr::nfs3;
 use fernfs::vfs::{Capabilities, DirEntry, NFSFileSystem, ReadDirResult};
 use mtp_rs::ObjectHandle;
-use pereprava_core::{names_eq_ci, DeviceHandle, StorageSummary};
+use pereprava_core::{DeviceHandle, StorageSummary, names_eq_ci};
 
 const DEVICE_ROOT_ID: u64 = 1;
 const STORAGE_BASE_ID: u64 = 2;
 const REAL_FLAG: u64 = 1 << 63;
+/// Virtual ids (created-but-unflushed files) carry this bit instead.
+const VIRT_FLAG: u64 = 1 << 62;
+
+/// A file staged on local disk, not yet (or no longer identical to) the
+/// device copy. See ADR-004.
+struct Stage {
+    tmp: PathBuf,
+    storage_index: usize,
+    /// NFS id of the parent directory.
+    parent_id: u64,
+    name: String,
+    size: u64,
+    /// Device handle when the file existed before staging started.
+    origin_dev: Option<u64>,
+    /// Device handle after the latest successful flush.
+    flushed_dev: Option<u64>,
+    dirty: bool,
+}
 
 /// NFS view of one connected MTP device.
 pub struct MtpNfs {
     dev: DeviceHandle,
     storages: tokio::sync::RwLock<Vec<StorageSummary>>,
     epoch: u32,
+    writable: bool,
+    staged: Mutex<HashMap<u64, Stage>>,
+    virt_seq: Mutex<u64>,
+    tmp_dir: PathBuf,
 }
 
 fn nfserr(e: pereprava_core::Error) -> nfs3::nfsstat3 {
@@ -62,7 +88,7 @@ fn decode(id: u64) -> Option<Kind> {
     if id == DEVICE_ROOT_ID {
         return Some(Kind::DeviceRoot);
     }
-    if id >= STORAGE_BASE_ID && id < REAL_FLAG {
+    if (STORAGE_BASE_ID..REAL_FLAG).contains(&id) {
         return Some(Kind::StorageRoot((id - STORAGE_BASE_ID) as usize));
     }
     if id & REAL_FLAG != 0 {
@@ -81,8 +107,10 @@ impl MtpNfs {
     ///
     /// # Errors
     /// Fails when the actor reports no storages.
-    pub async fn new(dev: DeviceHandle) -> Result<Self, pereprava_core::Error> {
+    pub async fn new(dev: DeviceHandle, writable: bool) -> Result<Self, pereprava_core::Error> {
         let storages = dev.storages().await?;
+        let tmp_dir = std::env::temp_dir().join(format!("pereprava-nfs-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).map_err(pereprava_core::Error::Io)?;
         Ok(Self {
             dev,
             storages: tokio::sync::RwLock::new(storages),
@@ -90,7 +118,268 @@ impl MtpNfs {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
                 .unwrap_or_default(),
+            writable,
+            staged: Mutex::new(HashMap::new()),
+            virt_seq: Mutex::new(0),
+            tmp_dir,
         })
+    }
+
+    /// Next virtual id for a created-but-unflushed file.
+    fn next_virt_id(&self) -> u64 {
+        let mut seq = self
+            .virt_seq
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *seq += 1;
+        VIRT_FLAG | *seq
+    }
+
+    fn tmp_path_for(&self, id: u64) -> PathBuf {
+        self.tmp_dir.join(format!("stage-{id:016x}.bin"))
+    }
+
+    /// Resolves the device handle for an NFS id, preferring flushed stage
+    /// mappings over the static encoding.
+    fn device_handle_of(&self, id: u64) -> Option<(usize, ObjectHandle)> {
+        if let Ok(st) = self.staged.lock()
+            && let Some(s) = st.get(&id)
+        {
+            return s.flushed_dev.map(|h| (s.storage_index, ObjectHandle(h)));
+        }
+        match decode(id)? {
+            Kind::Real(d) => Some((d.storage_index, d.handle)),
+            _ => None,
+        }
+    }
+
+    /// Parent directory handle + storage index for an NFS dir id.
+    /// Returns Err(NFS3ERR_PERM-equivalent IO) when the parent is itself
+    /// virtual (unflushed) — nested creation inside unflushed dirs is not
+    /// supported.
+    #[allow(clippy::type_complexity)]
+    fn parent_handle_of(&self, dir_id: u64) -> Result<(usize, ObjectHandle), nfs3::nfsstat3> {
+        match decode(dir_id) {
+            Some(Kind::StorageRoot(idx)) => Ok((idx, ObjectHandle::ROOT)),
+            Some(Kind::Real(d)) => Ok((d.storage_index, d.handle)),
+            _ => Err(nfs3::nfsstat3::NFS3ERR_INVAL),
+        }
+    }
+
+    /// Finds a staged entry whose parent+name matches; returns its id.
+    fn staged_lookup(&self, dir_id: u64, name: &str) -> Option<u64> {
+        let st = self.staged.lock().ok()?;
+        st.iter()
+            .find(|(_, s)| s.parent_id == dir_id && names_eq_ci(&s.name, name))
+            .map(|(id, _)| *id)
+    }
+
+    /// Pulls the current device object into a local staging slot so writes
+    /// can be applied offline. `dev` is the existing object handle.
+    async fn ensure_staged_existing(
+        &self,
+        id: u64,
+        d: Decoded,
+        name: String,
+        parent_id: u64,
+        size: u64,
+    ) -> Result<(), nfs3::nfsstat3> {
+        {
+            let st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            if st.contains_key(&id) {
+                return Ok(());
+            }
+        }
+        let tmp = self.tmp_path_for(id);
+        // Stream object -> local temp via bounded ranged reads.
+        use std::io::{Seek, Write};
+        let mut out = std::fs::File::create(&tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        let mut off = 0u64;
+        const CHUNK: u32 = 1024 * 1024;
+        while off < size {
+            let want = CHUNK.min((size - off) as u32);
+            let data = self
+                .dev
+                .hread_range(d.storage_index, d.handle, off, want)
+                .await
+                .map_err(nfserr)?;
+            if data.is_empty() {
+                break;
+            }
+            out.seek(std::io::SeekFrom::Start(off))
+                .and_then(|_| out.write_all(&data))
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            off += data.len() as u64;
+        }
+        out.sync_all().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        drop(out);
+        let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        st.insert(
+            id,
+            Stage {
+                tmp,
+                storage_index: d.storage_index,
+                parent_id,
+                name,
+                size,
+                origin_dev: Some(d.handle.0),
+                flushed_dev: None,
+                dirty: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Registers a fresh (empty) staged file under `dirid`.
+    async fn stage_new(
+        &self,
+        dirid: u64,
+        filename: &nfs3::filename3,
+    ) -> Result<u64, nfs3::nfsstat3> {
+        if !self.writable {
+            return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
+        }
+        self.parent_handle_of(dirid)?;
+        let name = String::from_utf8_lossy(filename).to_string();
+        if name.contains('/') || name.trim().is_empty() {
+            return Err(nfs3::nfsstat3::NFS3ERR_INVAL);
+        }
+
+        // Async device probe BEFORE taking the lock (guard must not cross await).
+        let existing_dev = self.lookup(dirid, filename).await.ok().and_then(|dev_id| {
+            self.device_handle_of(dev_id)
+                .map(|(idx, h)| (dev_id, idx, h))
+        });
+
+        let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+
+        // Reuse an already-staged entry with the same name.
+        for (vid, s) in st.iter_mut() {
+            if s.parent_id == dirid && names_eq_ci(&s.name, &name) {
+                return Ok(*vid);
+            }
+        }
+
+        match existing_dev {
+            Some((dev_id, idx, h)) => {
+                // Overwrite of an existing object: original is doomed at flush.
+                let tmp = self.tmp_path_for(dev_id);
+                std::fs::File::create(&tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+                st.insert(
+                    dev_id,
+                    Stage {
+                        tmp,
+                        storage_index: idx,
+                        parent_id: dirid,
+                        name,
+                        size: 0,
+                        origin_dev: Some(h.0),
+                        flushed_dev: None,
+                        dirty: true,
+                    },
+                );
+                Ok(dev_id)
+            }
+            None => {
+                let id = self.next_virt_id();
+                let tmp = self.tmp_path_for(id);
+                std::fs::File::create(&tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+                st.insert(
+                    id,
+                    Stage {
+                        tmp,
+                        storage_index: 0, // resolved from the parent at flush time
+                        parent_id: dirid,
+                        name,
+                        size: 0,
+                        origin_dev: None,
+                        flushed_dev: None,
+                        dirty: true,
+                    },
+                );
+                Ok(id)
+            }
+        }
+    }
+
+    /// Guarantees a staging slot exists for `id` before writes are applied.
+    async fn stage_for_writes(&self, id: u64) -> Result<(), nfs3::nfsstat3> {
+        if !self.writable {
+            return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
+        }
+        if let Ok(st) = self.staged.lock()
+            && st.contains_key(&id)
+        {
+            return Ok(());
+        }
+        match decode(id) {
+            Some(Kind::Real(d)) => {
+                let info = self
+                    .dev
+                    .hinfo(d.storage_index, d.handle)
+                    .await
+                    .map_err(nfserr)?;
+                // Parent NFS id from the object's recorded parent handle.
+                let parent_id = if info.parent == 0 {
+                    STORAGE_BASE_ID + d.storage_index as u64
+                } else {
+                    encode_real(d.storage_index, info.parent)
+                };
+                self.ensure_staged_existing(id, d, info.name.clone(), parent_id, info.size)
+                    .await
+            }
+            _ => Err(nfs3::nfsstat3::NFS3ERR_NOENT),
+        }
+    }
+
+    /// Flushes a dirty staged file to the device    /// Flushes a dirty staged file to the device: delete old object, upload
+    /// the local copy, remember the new handle.
+    async fn flush_stage(&self, id: u64) -> Result<(), nfs3::nfsstat3> {
+        let snapshot = {
+            let st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            st.get(&id).map(|s| {
+                (
+                    s.tmp.clone(),
+                    s.storage_index,
+                    s.parent_id,
+                    s.name.clone(),
+                    s.size,
+                    s.origin_dev,
+                )
+            })
+        };
+        let Some((tmp, idx, parent_id, name, size, origin_dev)) = snapshot else {
+            return Ok(());
+        };
+        // Parent must be resolvable to a real handle.
+        let (_p_idx, p_handle) = self.parent_handle_of(parent_id)?;
+
+        if let Some(old) = origin_dev {
+            let _ = self.dev.hdelete(idx, ObjectHandle(old)).await; // NotFound is fine
+        }
+        let file = tokio::fs::File::open(&tmp)
+            .await
+            .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        let new_entry = self
+            .dev
+            .hupload(
+                idx,
+                p_handle,
+                &name,
+                size,
+                Box::new(file),
+                silent_progress(),
+            )
+            .await
+            .map_err(nfserr)?;
+
+        let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        if let Some(s) = st.get_mut(&id) {
+            s.flushed_dev = Some(new_entry.handle);
+            s.dirty = false;
+            s.size = size;
+        }
+        Ok(())
     }
 
     fn attr_for(&self, id: u64, is_dir: bool, size: u64) -> nfs3::fattr3 {
@@ -130,7 +419,11 @@ impl NFSFileSystem for MtpNfs {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::ReadOnly
+        if self.writable {
+            Capabilities::ReadWrite
+        } else {
+            Capabilities::ReadOnly
+        }
     }
 
     fn root_dir(&self) -> nfs3::fileid3 {
@@ -185,6 +478,11 @@ impl NFSFileSystem for MtpNfs {
     }
 
     async fn getattr(&self, id: nfs3::fileid3) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
+        if let Ok(st) = self.staged.lock()
+            && let Some(s) = st.get(&id)
+        {
+            return Ok(self.attr_for(id, false, s.size));
+        }
         match decode(id) {
             Some(Kind::DeviceRoot) => Ok(self.attr_for(id, true, 0)),
             Some(Kind::StorageRoot(idx)) => {
@@ -208,10 +506,34 @@ impl NFSFileSystem for MtpNfs {
 
     async fn setattr(
         &self,
-        _id: nfs3::fileid3,
-        _setattr: nfs3::sattr3,
+        id: nfs3::fileid3,
+        setattr: nfs3::sattr3,
     ) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
-        Err(nfs3::nfsstat3::NFS3ERR_ROFS)
+        if !self.writable {
+            return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
+        }
+        // Only size changes are meaningful on MTP objects.
+        let new_size = match setattr.size {
+            None => return self.getattr(id).await,
+            Some(sz) => sz,
+        };
+        // Ensure the file is staged (pull current copy when it exists).
+        self.stage_for_writes(id).await?;
+        {
+            let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            if let Some(s) = st.get_mut(&id) {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&s.tmp)
+                    .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+                f.set_len(new_size)
+                    .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+                s.size = new_size;
+                s.dirty = true;
+                return Ok(self.attr_for(id, false, new_size));
+            }
+        }
+        Err(nfs3::nfsstat3::NFS3ERR_NOENT)
     }
 
     async fn read(
@@ -220,6 +542,22 @@ impl NFSFileSystem for MtpNfs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfs3::nfsstat3> {
+        // Staged copy wins: it may be dirty or newer than the device.
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            if let Some(s) = st.get(&id) {
+                let mut f = std::fs::File::open(&s.tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+                let total = f.metadata().map(|m| m.len()).unwrap_or(s.size);
+                let mut buf = vec![0u8; count as usize];
+                f.seek(SeekFrom::Start(offset))
+                    .and_then(|_| f.read(&mut buf))
+                    .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+                let eof = offset + buf.len() as u64 >= total;
+                buf.truncate(buf.len());
+                return Ok((buf, eof));
+            }
+        }
         match decode(id) {
             Some(Kind::Real(d)) => {
                 let info = self
@@ -248,56 +586,158 @@ impl NFSFileSystem for MtpNfs {
 
     async fn write(
         &self,
-        _id: nfs3::fileid3,
-        _offset: u64,
-        _data: &[u8],
-        _stable: fernfs::protocol::xdr::nfs3::file::stable_how,
+        id: nfs3::fileid3,
+        offset: u64,
+        data: &[u8],
+        stable: fernfs::protocol::xdr::nfs3::file::stable_how,
     ) -> Result<(nfs3::fattr3, nfs3::file::stable_how, nfs3::count3), nfs3::nfsstat3> {
-        Err(nfs3::nfsstat3::NFS3ERR_ROFS)
+        if !self.writable {
+            return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
+        }
+        self.stage_for_writes(id).await?;
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            let s = st.get_mut(&id).ok_or(nfs3::nfsstat3::NFS3ERR_NOENT)?;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&s.tmp)
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            f.seek(SeekFrom::Start(offset))
+                .and_then(|_| f.write_all(data))
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            s.size = s.size.max(offset + data.len() as u64);
+            s.dirty = true;
+            let attr = self.attr_for(id, false, s.size);
+            drop(st);
+            return Ok((attr, stable, data.len() as u32));
+        }
     }
 
     async fn create(
         &self,
-        _dirid: nfs3::fileid3,
-        _filename: &nfs3::filename3,
+        dirid: nfs3::fileid3,
+        filename: &nfs3::filename3,
         _attr: nfs3::sattr3,
     ) -> Result<(nfs3::fileid3, nfs3::fattr3), nfs3::nfsstat3> {
-        Err(nfs3::nfsstat3::NFS3ERR_ROFS)
+        let id = self.stage_new(dirid, filename).await?;
+        Ok((id, self.attr_for(id, false, 0)))
     }
 
     async fn create_exclusive(
         &self,
-        _dirid: nfs3::fileid3,
-        _filename: &nfs3::filename3,
+        dirid: nfs3::fileid3,
+        filename: &nfs3::filename3,
         _verifier: nfs3::createverf3,
     ) -> Result<nfs3::fileid3, nfs3::nfsstat3> {
-        Err(nfs3::nfsstat3::NFS3ERR_ROFS)
+        let name = String::from_utf8_lossy(filename);
+        if self.lookup(dirid, filename).await.is_ok() || self.staged_lookup(dirid, &name).is_some()
+        {
+            return Err(nfs3::nfsstat3::NFS3ERR_EXIST);
+        }
+        let id = self.stage_new(dirid, filename).await?;
+        Ok(id)
     }
 
     async fn mkdir(
         &self,
-        _dirid: nfs3::fileid3,
-        _dirname: &nfs3::filename3,
+        dirid: nfs3::fileid3,
+        dirname: &nfs3::filename3,
     ) -> Result<(nfs3::fileid3, nfs3::fattr3), nfs3::nfsstat3> {
-        Err(nfs3::nfsstat3::NFS3ERR_ROFS)
+        if !self.writable {
+            return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
+        }
+        let name = String::from_utf8_lossy(dirname).to_string();
+        let (idx, parent) = self.parent_handle_of(dirid)?;
+        let e = self.dev.hmkdir(idx, parent, &name).await.map_err(nfserr)?;
+        let id = encode_real(idx, e.handle);
+        Ok((id, self.attr_for(id, true, 0)))
     }
 
     async fn remove(
         &self,
-        _dirid: nfs3::fileid3,
-        _filename: &nfs3::filename3,
+        dirid: nfs3::fileid3,
+        filename: &nfs3::filename3,
     ) -> Result<(), nfs3::nfsstat3> {
-        Err(nfs3::nfsstat3::NFS3ERR_ROFS)
+        if !self.writable {
+            return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
+        }
+        let name = String::from_utf8_lossy(filename).to_string();
+
+        // Staged-but-unflushed: discard the stage, nothing on the device.
+        if let Some(virt_id) = self.staged_lookup(dirid, &name) {
+            if let Ok(mut st) = self.staged.lock()
+                && let Some(s) = st.remove(&virt_id)
+            {
+                drop(std::fs::remove_file(&s.tmp));
+            }
+            return Ok(());
+        }
+
+        // Device object: locate then delete by handle.
+        let fid = self.lookup(dirid, filename).await?;
+        match self.device_handle_of(fid) {
+            Some((idx, h)) => {
+                self.dev.hdelete(idx, h).await.map_err(nfserr)?;
+                // Drop any stage bound to this id.
+                if let Ok(mut st) = self.staged.lock()
+                    && let Some(s) = st.remove(&fid)
+                {
+                    drop(std::fs::remove_file(&s.tmp));
+                }
+                Ok(())
+            }
+            None => Err(nfs3::nfsstat3::NFS3ERR_NOENT),
+        }
     }
 
     async fn rename(
         &self,
-        _from_dirid: nfs3::fileid3,
-        _from_filename: &nfs3::filename3,
-        _to_dirid: nfs3::fileid3,
-        _to_filename: &nfs3::filename3,
+        from_dirid: nfs3::fileid3,
+        from_filename: &nfs3::filename3,
+        to_dirid: nfs3::fileid3,
+        to_filename: &nfs3::filename3,
     ) -> Result<(), nfs3::nfsstat3> {
-        Err(nfs3::nfsstat3::NFS3ERR_ROFS)
+        if !self.writable {
+            return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
+        }
+        let from_name = String::from_utf8_lossy(from_filename).to_string();
+        let to_name = String::from_utf8_lossy(to_filename).to_string();
+
+        // Staged-unflushed file: pure metadata update.
+        if let Some(virt_id) = self.staged_lookup(from_dirid, &from_name) {
+            let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            if let Some(s) = st.get_mut(&virt_id) {
+                s.parent_id = to_dirid;
+                s.name = to_name;
+            }
+            return Ok(());
+        }
+
+        let fid = self.lookup(from_dirid, from_filename).await?;
+        let (idx, _handle) = self
+            .device_handle_of(fid)
+            .ok_or(nfs3::nfsstat3::NFS3ERR_NOENT)?;
+        let (fp_idx, fp_handle) = self.parent_handle_of(from_dirid)?;
+        let (tp_idx, tp_handle) = self.parent_handle_of(to_dirid)?;
+        if fp_idx != tp_idx {
+            return Err(nfs3::nfsstat3::NFS3ERR_INVAL); // cross-storage not supported
+        }
+        self.dev
+            .hrename(idx, fp_handle, &from_name, tp_handle, &to_name)
+            .await
+            .map_err(nfserr)?;
+
+        // Keep stage metadata in sync for flushed files.
+        if let Ok(mut st) = self.staged.lock()
+            && let Some(s) = st.get_mut(&fid)
+        {
+            s.parent_id = to_dirid;
+            s.name = to_name;
+        }
+        Ok(())
     }
 
     async fn readdir(
@@ -346,7 +786,19 @@ impl NFSFileSystem for MtpNfs {
             }
             None => return Err(nfs3::nfsstat3::NFS3ERR_BADHANDLE),
         }
-        children.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        // Unflushed staged files are invisible to device listings — add them.
+        if let Ok(st) = self.staged.lock() {
+            for (vid, s) in st.iter() {
+                if s.parent_id != dirid || s.flushed_dev.is_some() {
+                    continue;
+                }
+                children.push((*vid, s.name.clone(), false, s.size));
+            }
+            children.sort_by_key(|c| c.1.to_lowercase());
+            children.dedup_by(|a, b| names_eq_ci(&a.1, &b.1));
+        }
+
+        children.sort_by_key(|c| c.1.to_lowercase());
 
         let total = children.len();
         let skip = (start_after as usize).min(total);
@@ -404,7 +856,14 @@ impl NFSFileSystem for MtpNfs {
         _offset: u64,
         _count: u32,
     ) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
-        // Read-only export: nothing to flush; echo current attributes.
+        if !self.writable {
+            return self.getattr(file_id).await;
+        }
+        self.flush_stage(file_id).await?;
         self.getattr(file_id).await
     }
+}
+
+fn silent_progress() -> tokio::sync::watch::Sender<pereprava_core::Progress> {
+    tokio::sync::watch::channel(pereprava_core::Progress { total: 0, done: 0 }).0
 }

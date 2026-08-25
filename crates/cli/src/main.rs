@@ -110,6 +110,9 @@ enum Cmd {
         /// Export subpath: "/" = all storages, "/1" = first storage root.
         #[arg(long, default_value = "/")]
         export: String,
+        /// Force read-only even when the device storage is writable.
+        #[arg(long)]
+        read_only: bool,
     },
     /// Detach a previously mounted pereprava volume.
     Unmount {
@@ -207,6 +210,7 @@ async fn main() {
             serve_only,
             allow_unprivileged_source_port,
             export,
+            read_only,
         } => {
             mountcmd::run(
                 std::path::PathBuf::from(path),
@@ -214,6 +218,7 @@ async fn main() {
                 serve_only,
                 allow_unprivileged_source_port,
                 export,
+                read_only,
             )
             .await
         }
