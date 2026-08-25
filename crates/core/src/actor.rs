@@ -241,7 +241,7 @@ impl DeviceHandle {
         // not enough: unrelated devices (USB-UART adapters, PTP cameras)
         // can precede the phone on the bus and surface as garbage responses
         // or timeouts.
-        let candidates = MtpDevice::list_devices().map_err(Error::mtp_msg)?;
+        let candidates = MtpDevice::list_devices().map_err(Error::from)?;
         if candidates.is_empty() {
             return Err(Error::Mtp("no device found".into()));
         }
@@ -625,7 +625,7 @@ impl ActorState {
                             is_dir: o.is_folder(),
                             size: o.size,
                         })
-                        .map_err(Error::mtp_msg),
+                        .map_err(Error::from),
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(out);
@@ -641,7 +641,7 @@ impl ActorState {
                     Ok(st) => st
                         .read_range(handle, offset, count)
                         .await
-                        .map_err(Error::mtp_msg),
+                        .map_err(Error::from),
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(out);
@@ -652,7 +652,7 @@ impl ActorState {
                 reply,
             } => {
                 let out = match self.open_storage(storage_index).await {
-                    Ok(st) => st.delete(handle).await.map_err(Error::mtp_msg),
+                    Ok(st) => st.delete(handle).await.map_err(Error::from),
                     Err(e) => Err(e),
                 };
                 if out.is_ok() {
@@ -702,7 +702,7 @@ impl ActorState {
                             is_dir: true,
                             size: 0,
                         })
-                        .map_err(Error::mtp_msg),
+                        .map_err(Error::from),
                     Err(e) => Err(e),
                 };
                 if out.is_ok() {
@@ -846,7 +846,7 @@ impl ActorState {
 
     async fn open_storage(&self, idx: usize) -> Result<mtp_rs::mtp::Storage> {
         let rec = self.storage(idx)?;
-        self.device.storage(rec.id).await.map_err(Error::mtp_msg)
+        self.device.storage(rec.id).await.map_err(Error::from)
     }
 
     fn find_storage_index(&self, reference: &str) -> Result<usize> {
@@ -892,7 +892,7 @@ impl ActorState {
                 Some(dir)
             })
             .await
-            .map_err(Error::mtp_msg)?;
+            .map_err(Error::from)?;
         let entries: Vec<Entry> = objs
             .into_iter()
             .map(|o| Entry {
@@ -949,7 +949,7 @@ impl ActorState {
         }
         // Authoritative metadata straight from the device.
         let storage = self.open_storage(idx).await?;
-        let oi = storage.get_object_info(cur).await.map_err(Error::mtp_msg)?;
+        let oi = storage.get_object_info(cur).await.map_err(Error::from)?;
         Ok(Resolved {
             storage_index: idx,
             handle: cur,
@@ -1052,7 +1052,7 @@ impl ActorState {
                                 rest,
                             )
                             .await
-                            .map_err(Error::mtp_msg)?;
+                            .map_err(Error::from)?;
                         let sid = self.storage(idx)?.id.0 as u32;
                         self.cache.invalidate(sid, cur.0, None);
                         cur = h;
@@ -1102,7 +1102,7 @@ impl ActorState {
             storage
                 .delete(ObjectHandle(target.handle))
                 .await
-                .map_err(Error::mtp_msg)?;
+                .map_err(Error::from)?;
             1
         };
 
@@ -1126,12 +1126,12 @@ impl ActorState {
                     count += self.delete_tree(idx, h).await?;
                 } else {
                     let storage = self.open_storage(idx).await?;
-                    storage.delete(h).await.map_err(Error::mtp_msg)?;
+                    storage.delete(h).await.map_err(Error::from)?;
                     count += 1;
                 }
             }
             let storage = self.open_storage(idx).await?;
-            storage.delete(dir).await.map_err(Error::mtp_msg)?;
+            storage.delete(dir).await.map_err(Error::from)?;
             let sid = self.storage(idx)?.id.0 as u32;
             self.cache.invalidate(sid, dir.0, None);
             Ok(count + 1)
@@ -1165,7 +1165,7 @@ impl ActorState {
             storage
                 .move_object(ObjectHandle(src.handle), to_parent, Some(sid))
                 .await
-                .map_err(Error::mtp_msg)?;
+                .map_err(Error::from)?;
             self.cache
                 .invalidate(sid.0 as u32, from_parent.0, Some(src.handle));
             self.cache.invalidate(sid.0 as u32, to_parent.0, None);
@@ -1178,7 +1178,7 @@ impl ActorState {
                 storage
                     .rename(final_handle, to_name)
                     .await
-                    .map_err(Error::mtp_msg)?;
+                    .map_err(Error::from)?;
                 let sid32 = sid.0 as u32;
                 self.cache.invalidate(sid32, to_parent.0, None);
             }
@@ -1187,7 +1187,7 @@ impl ActorState {
         let info = storage
             .get_object_info(final_handle)
             .await
-            .map_err(Error::mtp_msg)?;
+            .map_err(Error::from)?;
         Ok(Entry {
             handle: info.handle.0,
             parent: info.parent.0,
@@ -1221,7 +1221,7 @@ impl ActorState {
         storage
             .rename(ObjectHandle(target.handle), new_name)
             .await
-            .map_err(Error::mtp_msg)?;
+            .map_err(Error::from)?;
 
         let sid = self.storage(idx)?.id.0 as u32;
         self.cache.invalidate(sid, parent.0, Some(target.handle));
@@ -1229,7 +1229,7 @@ impl ActorState {
         let info = storage
             .get_object_info(ObjectHandle(target.handle))
             .await
-            .map_err(Error::mtp_msg)?;
+            .map_err(Error::from)?;
         Ok(Entry {
             handle: info.handle.0,
             parent: info.parent.0,
@@ -1272,7 +1272,7 @@ impl ActorState {
         storage
             .move_object(ObjectHandle(target.handle), dst_dir.handle, Some(sid))
             .await
-            .map_err(Error::mtp_msg)?;
+            .map_err(Error::from)?;
 
         self.cache
             .invalidate(sid_u32, src_parent.0, Some(target.handle));
@@ -1281,7 +1281,7 @@ impl ActorState {
         let info = storage
             .get_object_info(ObjectHandle(target.handle))
             .await
-            .map_err(Error::mtp_msg)?;
+            .map_err(Error::from)?;
         Ok(Entry {
             handle: info.handle.0,
             parent: info.parent.0,
@@ -1301,14 +1301,14 @@ impl ActorState {
         let mut dl = storage
             .download(target.handle, ByteRange::Full)
             .await
-            .map_err(Error::mtp_msg)?;
+            .map_err(Error::from)?;
 
         let total = dl.size();
         progress.send_replace(Progress { total, done: 0 });
 
         let mut written: u64 = 0;
         while let Some(chunk) = dl.next_chunk().await {
-            let chunk = chunk.map_err(Error::mtp_msg)?;
+            let chunk = chunk.map_err(Error::from)?;
             writer.write_all(&chunk).await?;
             written += chunk.len() as u64;
             progress.send_replace(Progress {
@@ -1388,7 +1388,7 @@ impl ActorState {
                     drop(storage.delete(ph).await);
                 }
                 ticker.abort();
-                return Err(Error::mtp_msg(&ue));
+                return Err(Error::from(ue.source));
             }
         };
         ticker.abort();
@@ -1399,7 +1399,7 @@ impl ActorState {
         let oi = storage
             .get_object_info(uploaded)
             .await
-            .map_err(Error::mtp_msg)?;
+            .map_err(Error::from)?;
         Ok(Entry {
             handle: oi.handle.0,
             parent: oi.parent.0,

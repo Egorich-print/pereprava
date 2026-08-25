@@ -12,9 +12,28 @@ use crate::format::human_bytes;
 
 /// Opens the first MTP device with a friendly error context.
 pub async fn connect() -> anyhow::Result<DeviceHandle> {
-    DeviceHandle::connect_first()
-        .await
-        .context("failed to open MTP device (run `pereprava doctor` for diagnostics)")
+    const TRIES: u32 = 3;
+    let mut last: Option<anyhow::Error> = None;
+    for i in 0..TRIES {
+        match DeviceHandle::connect_first().await {
+            Ok(d) => return Ok(d),
+            Err(e) => {
+                let s = e.to_string().to_ascii_lowercase();
+                // ptpcamerad races and post-OTA USB churn produce these.
+                let transient =
+                    s.contains("exclusive") || s.contains("timed out") || s.contains("busy");
+                last =
+                    Some(anyhow::Error::from(e).context(
+                        "failed to open MTP device (run `pereprava doctor` for diagnostics)",
+                    ));
+                if !(transient && i + 1 < TRIES) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("unknown connect failure")))
 }
 
 /// Runs `f` with a connected device and ALWAYS closes the session afterwards.

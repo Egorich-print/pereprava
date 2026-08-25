@@ -32,6 +32,20 @@ pub enum Error {
     /// The actor channel is closed (actor task died).
     #[error("device actor is not running")]
     ActorClosed,
+
+    /// USB link/session lost mid-operation — a reconnect may help.
+    #[error("device disconnected")]
+    Disconnected,
+}
+
+impl From<mtp_rs::Error> for Error {
+    fn from(e: mtp_rs::Error) -> Self {
+        if e.is_disconnected() || e.is_stale_handle() {
+            Error::Disconnected
+        } else {
+            Error::Mtp(e.to_string())
+        }
+    }
 }
 
 impl Error {
