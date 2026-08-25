@@ -5,6 +5,7 @@ mod bundle;
 mod commands;
 mod doctor;
 mod format;
+mod mountcmd;
 mod progress;
 
 use clap::{Parser, Subcommand};
@@ -92,15 +93,44 @@ enum Cmd {
         /// Local extraction target directory.
         dest: String,
     },
+    /// Mount the phone in Finder as a read-only NFS volume (Ctrl-C to eject).
+    Mount {
+        /// Mount point (default /Volumes/pereprava).
+        #[arg(long, default_value = "/Volumes/pereprava")]
+        path: String,
+        /// Local TCP port for the loopback NFS server.
+        #[arg(long, default_value_t = 34567)]
+        port: u16,
+        /// Debug: serve NFS without invoking mount_nfs.
+        #[arg(long)]
+        serve_only: bool,
+        /// Debug/test: accept clients from unprivileged source ports.
+        #[arg(long)]
+        allow_unprivileged_source_port: bool,
+        /// Export subpath: "/" = all storages, "/1" = first storage root.
+        #[arg(long, default_value = "/")]
+        export: String,
+    },
+    /// Detach a previously mounted pereprava volume.
+    Unmount {
+        /// Mount point.
+        #[arg(long, default_value = "/Volumes/pereprava")]
+        path: String,
+    },
 }
 
 fn init_logging(verbose: bool) {
     use tracing_subscriber::EnvFilter;
-    let filter = if verbose {
-        EnvFilter::new("pereprava=trace,mtp_rs=info,nusb=info")
-    } else {
-        EnvFilter::new("pereprava=warn")
-    };
+    // RUST_LOG wins over the -v default so `fernfs` internals can be traced.
+    let filter = std::env::var("RUST_LOG")
+        .map(EnvFilter::new)
+        .unwrap_or_else(|_| {
+            if verbose {
+                EnvFilter::new("pereprava=trace,mtp_rs=info,nusb=info,fernfs=debug")
+            } else {
+                EnvFilter::new("pereprava=warn")
+            }
+        });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -171,6 +201,23 @@ async fn main() {
             })
             .await
         }
+        Cmd::Mount {
+            path,
+            port,
+            serve_only,
+            allow_unprivileged_source_port,
+            export,
+        } => {
+            mountcmd::run(
+                std::path::PathBuf::from(path),
+                port,
+                serve_only,
+                allow_unprivileged_source_port,
+                export,
+            )
+            .await
+        }
+        Cmd::Unmount { path } => mountcmd::detach(std::path::PathBuf::from(path)).await,
     };
 
     if let Err(e) = result {

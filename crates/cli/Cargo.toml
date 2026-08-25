@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 pereprava-core = { path = "../core" }
+pereprava-nfs = { path = "../nfs-mount" }
 mtp-rs = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

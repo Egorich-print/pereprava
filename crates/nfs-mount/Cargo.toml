@@ -1,0 +1,21 @@
+[package]
+name = "pereprava-nfs"
+description = "NFSv3 loopback mount backend exposing the MTP device (fernfs-based)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+pereprava-core = { path = "../core" }
+fernfs = { path = "../../vendor/fernfs" }
+mtp-rs = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+tracing = { workspace = true }
+async-trait = "0.1"
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

@@ -49,6 +49,30 @@ pub struct Resolved {
 enum Request {
     /// Stops the actor loop and closes the device session.
     Shutdown,
+    /// Handle-based listing for the NFS adapter (bypasses path parsing).
+    HList {
+        storage_index: usize,
+        dir: ObjectHandle,
+        reply: oneshot::Sender<Result<Vec<Entry>>>,
+    },
+    /// Handle-based metadata fetch for the NFS adapter.
+    HInfo {
+        storage_index: usize,
+        handle: ObjectHandle,
+        reply: oneshot::Sender<Result<Entry>>,
+    },
+    /// Handle-based partial read for the NFS adapter.
+    HRead {
+        storage_index: usize,
+        handle: ObjectHandle,
+        offset: u64,
+        count: u32,
+        reply: oneshot::Sender<Result<Vec<u8>>>,
+    },
+    /// Storage table snapshot (id/index/description) without opening more sessions.
+    Storages {
+        reply: oneshot::Sender<Result<Vec<StorageSummary>>>,
+    },
     Info {
         reply: oneshot::Sender<Result<DeviceSummary>>,
     },
@@ -241,6 +265,51 @@ impl DeviceHandle {
         rx.await.map_err(|_| Error::ActorClosed)?
     }
 
+    /// Handle-based listing of `dir` on storage `storage_index`.
+    ///
+    /// Used by the NFS adapter where ids are already handles.
+    pub async fn hlist(&self, storage_index: usize, dir: ObjectHandle) -> Result<Vec<Entry>> {
+        self.call(|reply| Request::HList {
+            storage_index,
+            dir,
+            reply,
+        })
+        .await
+    }
+
+    /// Handle-based metadata fetch.
+    pub async fn hinfo(&self, storage_index: usize, handle: ObjectHandle) -> Result<Entry> {
+        self.call(|reply| Request::HInfo {
+            storage_index,
+            handle,
+            reply,
+        })
+        .await
+    }
+
+    /// Handle-based partial read (`offset..offset+count`).
+    pub async fn hread_range(
+        &self,
+        storage_index: usize,
+        handle: ObjectHandle,
+        offset: u64,
+        count: u32,
+    ) -> Result<Vec<u8>> {
+        self.call(|reply| Request::HRead {
+            storage_index,
+            handle,
+            offset,
+            count,
+            reply,
+        })
+        .await
+    }
+
+    /// Storage table snapshot.
+    pub async fn storages(&self) -> Result<Vec<StorageSummary>> {
+        self.call(|reply| Request::Storages { reply }).await
+    }
+
     /// Device + storages summary.
     pub async fn info(&self) -> Result<DeviceSummary> {
         self.call(|reply| Request::Info { reply }).await
@@ -386,6 +455,63 @@ impl ActorState {
     async fn dispatch(&mut self, req: Request) {
         match req {
             Request::Shutdown => {} // handled by the run loop
+            Request::HList {
+                storage_index,
+                dir,
+                reply,
+            } => {
+                let _ = reply.send(self.children_of(storage_index, dir, false).await);
+            }
+            Request::HInfo {
+                storage_index,
+                handle,
+                reply,
+            } => {
+                let out = match self.open_storage(storage_index).await {
+                    Ok(st) => st
+                        .get_object_info(handle)
+                        .await
+                        .map(|o| Entry {
+                            handle: o.handle.0,
+                            parent: o.parent.0,
+                            name: o.filename.clone(),
+                            is_dir: o.is_folder(),
+                            size: o.size,
+                        })
+                        .map_err(Error::mtp_msg),
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(out);
+            }
+            Request::HRead {
+                storage_index,
+                handle,
+                offset,
+                count,
+                reply,
+            } => {
+                let out = match self.open_storage(storage_index).await {
+                    Ok(st) => st
+                        .read_range(handle, offset, count)
+                        .await
+                        .map_err(Error::mtp_msg),
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(out);
+            }
+            Request::Storages { reply } => {
+                let _ = reply.send(Ok(self
+                    .storages
+                    .iter()
+                    .map(|s| StorageSummary {
+                        id: s.id.0 as u32,
+                        description: s.description.clone(),
+                        capacity: s.capacity,
+                        free: s.free,
+                        writable: s.writable,
+                    })
+                    .collect()));
+            }
             Request::Info { reply } => {
                 let _ = reply.send(Ok(self.summary()));
             }
