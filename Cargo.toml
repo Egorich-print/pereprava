@@ -21,6 +21,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
+bytes = "1"
 
 # First-party code forbids unsafe and deny unwrap/expect/panic.
 # Third-party crates may contain their own vetted unsafe internals
