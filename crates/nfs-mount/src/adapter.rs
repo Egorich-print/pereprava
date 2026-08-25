@@ -73,6 +73,7 @@ struct Decoded {
     handle: ObjectHandle,
 }
 
+#[derive(Debug)]
 enum Kind {
     DeviceRoot,
     StorageRoot(usize),
@@ -85,6 +86,10 @@ fn encode_real(storage_index: usize, handle: u64) -> u64 {
 }
 
 fn decode(id: u64) -> Option<Kind> {
+    if id & VIRT_FLAG != 0 {
+        // Staged-only ids are owned by the stage map, never by static decoding.
+        return None;
+    }
     if id == DEVICE_ROOT_ID {
         return Some(Kind::DeviceRoot);
     }
@@ -866,4 +871,59 @@ impl NFSFileSystem for MtpNfs {
 
 fn silent_progress() -> tokio::sync::watch::Sender<pereprava_core::Progress> {
     tokio::sync::watch::channel(pereprava_core::Progress { total: 0, done: 0 }).0
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_id_roundtrip() {
+        let id = encode_real(3, 0x1234_5678_9abc);
+        assert_eq!(id & REAL_FLAG, REAL_FLAG);
+        match decode(id) {
+            Some(Kind::Real(d)) => {
+                assert_eq!(d.storage_index, 3);
+                assert_eq!(d.handle.0, 0x1234_5678_9abc);
+            }
+            other => panic!("expected Real, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthetic_ids_are_recognized() {
+        assert!(matches!(decode(DEVICE_ROOT_ID), Some(Kind::DeviceRoot)));
+        assert!(matches!(
+            decode(STORAGE_BASE_ID + 2),
+            Some(Kind::StorageRoot(2))
+        ));
+    }
+
+    #[test]
+    fn virtual_ids_never_collide_with_real() {
+        // bit62 set, bit63 clear
+        let virt = VIRT_FLAG | 0x42;
+        assert_eq!(virt & REAL_FLAG, 0);
+        assert!(decode(virt).is_none(), "virtual ids stay out of decode()");
+        let real = encode_real(0, virt & 0xFFFF_FFFF_FFFF);
+        assert_ne!(real & VIRT_FLAG, VIRT_FLAG);
+    }
+
+    #[test]
+    fn zero_and_virtual_decode_to_none() {
+        assert!(decode(0).is_none());
+        let virt = VIRT_FLAG | 0x42;
+        assert!(decode(virt).is_none(), "virtual ids bypass decode()");
+    }
+
+    #[test]
+    fn wide_storage_range_is_by_contract() {
+        // Any id in (STORAGE_BASE..REAL_FLAG) parses as a storage root;
+        // bounds are validated later against the live storage table.
+        assert!(matches!(
+            decode(STORAGE_BASE_ID + 12345),
+            Some(Kind::StorageRoot(12345))
+        ));
+    }
 }
