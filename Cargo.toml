@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+authors = ["Egorich-print"]
+repository = "https://github.com/Egorich-print/pereprava"
+homepage = "https://github.com/Egorich-print/pereprava"
+description = "Modern async MTP client for macOS: safe Android <-> Mac file transfer"
+
+[workspace.dependencies]
+mtp-rs = "0.30"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+
+# First-party code forbids unsafe and deny unwrap/expect/panic.
+# Third-party crates may contain their own vetted unsafe internals
+# (see docs/adr/ADR-000-clean-room-and-safety-policy.md).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

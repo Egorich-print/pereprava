@@ -1,0 +1,19 @@
+[package]
+name = "pereprava-core"
+description = "Async MTP device actor and metadata cache for pereprava"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+mtp-rs = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time", "fs", "io-util"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true

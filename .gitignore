@@ -1,0 +1,9 @@
+/target
+Cargo.lock.orig
+*.swp
+.DS_Store
+.idea/
+.vscode/
+*.log
+.env
+bench-out/

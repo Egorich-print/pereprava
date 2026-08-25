@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy (deny unwrap/expect/panic)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests (unit only; device tests are gated)
+        run: cargo test --workspace
+      - name: Dependency audit
+        run: |
+          cargo install cargo-deny --locked || true
+          cargo deny check advisories 2>/dev/null || true
