@@ -203,22 +203,65 @@ impl DeviceHandle {
     /// Propagates transport/session errors from mtp-rs (exclusive access,
     /// no device plugged, ...).
     pub async fn connect_first() -> Result<Self> {
-        let device = MtpDevice::open_first().await.map_err(Error::mtp_msg)?;
-
-        let mut storages = Vec::new();
-        for s in device.storages().await.map_err(Error::mtp_msg)? {
-            let info = s.info();
-            storages.push(StorageRec {
-                id: info.id,
-                description: info.description.clone(),
-                capacity: info.total_capacity,
-                free: info.free_space,
-                writable: info.is_writable,
-            });
+        // Try every USB candidate in enumeration order and keep the first
+        // one that completes an actual MTP session. A bare open_first() is
+        // not enough: unrelated devices (USB-UART adapters, PTP cameras)
+        // can precede the phone on the bus and surface as garbage responses
+        // or timeouts.
+        let candidates = MtpDevice::list_devices().map_err(Error::mtp_msg)?;
+        if candidates.is_empty() {
+            return Err(Error::Mtp("no device found".into()));
         }
 
+        let mut last_err: Option<Error> = None;
+        for cand in &candidates {
+            match MtpDevice::builder()
+                .open_by_location(cand.location_id)
+                .await
+            {
+                Ok(device) => return Self::spawn_actor(device).await,
+                Err(e) => {
+                    tracing::debug!(
+                        "candidate {:04x}:{:04x} rejected: {e}",
+                        cand.vendor_id,
+                        cand.product_id
+                    );
+                    last_err = Some(Error::mtp_msg(&e));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Mtp("no openable device".into())))
+    }
+
+    async fn spawn_actor(device: MtpDevice) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<Request>(16);
         let (done_tx, done_rx) = oneshot::channel::<()>();
+
+        // Storages must be read on the task that owns the session; hand the
+        // device over to it and wait for the storage table here.
+        let (st_tx, st_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut storages = Vec::new();
+            if let Ok(list) = device.storages().await {
+                for s in list {
+                    let info = s.info();
+                    storages.push(StorageRec {
+                        id: info.id,
+                        description: info.description.clone(),
+                        capacity: info.total_capacity,
+                        free: info.free_space,
+                        writable: info.is_writable,
+                    });
+                }
+            }
+            let _ = st_tx.send((device, storages));
+        });
+        let (device, read_storages) = match st_rx.await {
+            Ok(v) => v,
+            Err(_) => return Err(Error::ActorClosed),
+        };
+        let storages = read_storages;
+
         let state = ActorState {
             device,
             storages,
