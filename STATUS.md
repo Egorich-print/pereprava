@@ -5,22 +5,34 @@
 ## Current State
 
 **Стадия:** Active Development
-**Версия:** 0.2.0 (в разработке; v0.1.0 тегирован)
-**Дата обновления:** 2026-08-25
+**Версия:** 0.3.0 (в разработке; v0.1.0 тегирован)
+**Дата обновления:** 2026-08-26
 
 ### Готово
 
 - **v0.1.0 (тег)**: CLI `ls/pull/push/mkdir/rm/mv/info/doctor/bench`,
   device-actor над mtp-rs, graceful close, кэш метаданных, CI.
-  Интеграционный тест на реальном телефоне — зелёный.
-- **Бенчмарки (v0.1.x)**: baseline на Nothing Phone A065 / USB 2.0:
-  большие файлы ~37 MiB/s (предел шины), мелкие ~35 ms/object.
-  → docs/benchmarks/baseline.md
-- **v0.2 bundle-mode**: `pack`/`unpack` (.tar.zst одним объектом),
-  `bench --bundle`. Замер: 500 файлов 21.95s → 0.09s (**233×**).
-  Roundtrip побайтово верифицирован.
+- **Бенчмарки**: baseline на Nothing Phone A065 / USB 2.0 — большие файлы
+  ~37 MiB/s (предел шины), мелкие ~35 ms/object → docs/benchmarks/baseline.md
+- **v0.2 bundle-mode**: pack/unpack (.tar.zst одним объектом), 500 файлов
+  21.95s → 0.09s (**233×**).
+- **v0.3 NFS-mount (read-only MVP)**: телефон как том в Finder БЕЗ kext —
+  fernfs-сервер на loopback + нативный mount_nfs. Проверено: nfs-ls/nfs-cat
+  через libnfs, живой mount /Volumes/pereprava с листингом каталогов.
+  → docs/status/v0.3-nfs-mount.md
 
-### Решения по итогам измерений
+### Текущий известный нюанс
+
+Зависший при отладке том `/Volumes/pereprava` (жёсткий mount при убитом
+сервере — до внедрения soft-опции) снимается одной командой:
+`sudo umount -f /Volumes/pereprava`. Новые монтирования используют soft.
+
+### Не начато
+
+- v0.4: write-back staging для записи через том (как в simple-mtpfs).
+- Реестр/Obsidian/showcase — строка ниже добавляется отдельным коммитом.
+
+## Решения по итогам измерений
 
 - Bundle-mode принят (gate ≥25% из ADR-003 перекрыт в ~900 раз).
 - ADB-zstd транспорт отложен: после bundle-mode его целевой bottleneck

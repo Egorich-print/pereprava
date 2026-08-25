@@ -6,6 +6,15 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v0.3)
+
+- `pereprava mount` / `unmount`: the phone appears in Finder as a read-only
+  NFSv3 volume — no kernel extensions, native `mount_nfs`, one admin prompt.
+- `crates/nfs-mount`: fernfs-based adapter (vendored) mapping NFS ids onto
+  MTP handles; READ clamped to object bounds (Android rejects over-reads).
+- mount options hardened with `soft,retry=1,retrans=2,timeo=50`.
+- `--serve-only`, `--export`, `--allow-unprivileged-source-port` debug knobs.
+
 ### Added (v0.2)
 
 - `pereprava pack` / `pereprava unpack`: directory tree ⇄ one `.tar.zst`
