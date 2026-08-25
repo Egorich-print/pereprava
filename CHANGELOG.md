@@ -6,6 +6,20 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v0.4)
+
+- Writable Finder volume: write-back staging per ADR-004 — POSIX writes land
+  in a local stage and flush to the device on COMMIT as delete+upload;
+  `flushed_dev` rebinding keeps kernel filehandles valid across flushes.
+- Core: handle-based mutations (HDelete/HUpload/HMkdir/HRename) so the NFS
+  adapter never re-resolves paths on the hot path.
+- `Error::Disconnected` classification preserved from mtp-rs predicates;
+  `connect()` retries 3× against ptpcamerad/post-OTA races; connect_first
+  probes every USB candidate instead of trusting enumeration order.
+- `mount --read-only`; default mount is writable when the device allows.
+- Root-free write E2E harness: `scripts/e2e-write-test.sh`.
+
+
 ### Added (v0.3)
 
 - `pereprava mount` / `unmount`: the phone appears in Finder as a read-only

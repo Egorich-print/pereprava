@@ -56,6 +56,8 @@ pereprava rm [-r] <remote>       # delete on device
 pereprava pack   <local-dir> [remote-parent]   # -> <name>.tar.zst
 pereprava unpack <remote.tar.zst> <dest-dir>   # extract locally
 
+pereprava mount                  # phone appears in Finder (WRITABLE!)
+pereprava mount --read-only      # read-only variant
 pereprava bench [--bundle]       # throughput micro-benchmarks
 ```
 

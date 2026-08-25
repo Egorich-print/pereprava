@@ -5,52 +5,29 @@
 ## Current State
 
 **Стадия:** Active Development
-**Версия:** 0.3.0 (в разработке; v0.1.0 тегирован)
-**Дата обновления:** 2026-08-26
+**Версия:** 0.4.0 (в разработке; v0.1.0 тегирован, v0.3 смонтирован и обкатан руками)
+**Дата обновления:** 2026-08-26 (ночная смена)
 
 ### Готово
 
-- **v0.1.0 (тег)**: CLI `ls/pull/push/mkdir/rm/mv/info/doctor/bench`,
-  device-actor над mtp-rs, graceful close, кэш метаданных, CI.
-- **Бенчмарки**: baseline на Nothing Phone A065 / USB 2.0 — большие файлы
-  ~37 MiB/s (предел шины), мелкие ~35 ms/object → docs/benchmarks/baseline.md
-- **v0.2 bundle-mode**: pack/unpack (.tar.zst одним объектом), 500 файлов
-  21.95s → 0.09s (**233×**).
-- **v0.3 NFS-mount (read-only MVP)**: телефон как том в Finder БЕЗ kext —
-  fernfs-сервер на loopback + нативный mount_nfs. Проверено: nfs-ls/nfs-cat
-  через libnfs, живой mount /Volumes/pereprava с листингом каталогов.
-  → docs/status/v0.3-nfs-mount.md
+- **v0.1**: CLI ls/pull/push/mkdir/rm/mv/info/doctor/bench + device-actor.
+- **v0.2**: bundle-mode — 500 файлов 21.95s → 0.09s (**233×**).
+- **v0.3**: Finder-mount через NFSv3 loopback, read-only, проверено руками.
+- **v0.4 (ночь)**: том ЗАПИСЫВАЕМЫЙ — write-back staging по ADR-004
+  (write→stage, COMMIT→delete+upload, flushed_dev перепривязывает fh);
+  хэндл-мутации в ядре; Disconnected-классификация; patient connect;
+  connect_first перебирает кандидатов (урок USB-UART на шине);
+  root-free e2e-скрипт записи.
 
-### Текущий известный нюанс
+### Ожидает устройства
 
-Зависший при отладке том `/Volumes/pereprava` (жёсткий mount при убитом
-сервере — до внедрения soft-опции) снимается одной командой:
-`sudo umount -f /Volumes/pereprava`. Новые монтирования используют soft.
+- Прогон `scripts/e2e-write-test.sh` (телефон ушёл с шины из-за OTA;
+  после загрузки — режим «Передача файлов» + разрешить доступ к данным).
 
-### Не начато
+### Дальше
 
-- v0.4: write-back staging для записи через том (как в simple-mtpfs).
-- Реестр/Obsidian/showcase — строка ниже добавляется отдельным коммитом.
-
-## Решения по итогам измерений
-
-- Bundle-mode принят (gate ≥25% из ADR-003 перекрыт в ~900 раз).
-- ADB-zstd транспорт отложен: после bundle-mode его целевой bottleneck
-  перестал доминировать (запись в benchmarks и ADR-003).
-
-### Не начато
-
-- v0.3 NFS-mount через вендоренный fernfs → том в Finder.
-
-### Известные ограничения v0.2
-
-- `push` дерева поверх существующих имён требует предварительного `rm`
-  (Android отвечает GeneralError на дубли); одиночный файл — `--force`.
-- Распаковка на телефоне не автоматизирована (архив лежит как объект).
-- ptpcamerad может перехватывать устройство между запусками — `doctor`
-  печатает фикс; при жёстком убийстве процесса телефон «клинит» до
-  переключения USB-режима (лечится `svc usb setFunctions mtp` или
-  переустановкой режима передачи на самом телефоне).
+- v0.5: атомарный flush (upload-new → rename), авто-reconnect актора,
+  xattr-заглушки через NFSv3? (нет — только при переходе на v4), Homebrew tap.
 
 ## Risks
 
