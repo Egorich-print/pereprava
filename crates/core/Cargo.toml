@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+unicode-normalization = "0.1"
 
 [lints]
 workspace = true

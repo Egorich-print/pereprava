@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::cache::MetaCache;
 use crate::error::{Error, Result};
 use crate::model::{DeviceSummary, Entry, Progress, StorageSummary};
+use crate::names::names_eq_ci;
 use crate::path::DevPath;
 
 /// Upload read chunk (kept modest so bounded channels stay meaningful).
@@ -68,6 +69,38 @@ enum Request {
         offset: u64,
         count: u32,
         reply: oneshot::Sender<Result<Vec<u8>>>,
+    },
+    /// Handle-based single-object delete (device rejects non-empty dirs).
+    HDelete {
+        storage_index: usize,
+        handle: ObjectHandle,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Handle-based upload into an arbitrary parent directory.
+    HUpload {
+        storage_index: usize,
+        parent: ObjectHandle,
+        name: String,
+        size: u64,
+        reader: Box<dyn AsyncRead + Unpin + Send>,
+        progress: watch::Sender<Progress>,
+        done: oneshot::Sender<Result<Entry>>,
+    },
+    /// Handle-based directory creation.
+    HMkdir {
+        storage_index: usize,
+        parent: ObjectHandle,
+        name: String,
+        reply: oneshot::Sender<Result<Entry>>,
+    },
+    /// Handle-based rename/move within one storage.
+    HRename {
+        storage_index: usize,
+        from_parent: ObjectHandle,
+        from_name: String,
+        to_parent: ObjectHandle,
+        to_name: String,
+        reply: oneshot::Sender<Result<Entry>>,
     },
     /// Storage table snapshot (id/index/description) without opening more sessions.
     Storages {
@@ -472,6 +505,77 @@ impl DeviceHandle {
         })
         .await
     }
+
+    /// Handle-based single-object delete.
+    pub async fn hdelete(&self, storage_index: usize, handle: ObjectHandle) -> Result<()> {
+        self.call(|reply| Request::HDelete {
+            storage_index,
+            handle,
+            reply,
+        })
+        .await
+    }
+
+    /// Handle-based upload into `parent` directory.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hupload(
+        &self,
+        storage_index: usize,
+        parent: ObjectHandle,
+        name: &str,
+        size: u64,
+        reader: Box<dyn AsyncRead + Unpin + Send>,
+        progress: watch::Sender<Progress>,
+    ) -> Result<Entry> {
+        self.call(|done| Request::HUpload {
+            storage_index,
+            parent,
+            name: name.to_string(),
+            size,
+            reader,
+            progress,
+            done,
+        })
+        .await
+    }
+
+    /// Handle-based directory creation under `parent`.
+    pub async fn hmkdir(
+        &self,
+        storage_index: usize,
+        parent: ObjectHandle,
+        name: &str,
+    ) -> Result<Entry> {
+        self.call(|reply| Request::HMkdir {
+            storage_index,
+            parent,
+            name: name.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Handle-based rename/move within one storage.
+    ///
+    /// Same parent => pure rename; different parent => move then rename.
+    pub async fn hrename(
+        &self,
+        storage_index: usize,
+        from_parent: ObjectHandle,
+        from_name: &str,
+        to_parent: ObjectHandle,
+        to_name: &str,
+    ) -> Result<Entry> {
+        self.call(|reply| Request::HRename {
+            storage_index,
+            from_parent,
+            from_name: from_name.to_string(),
+            to_parent,
+            to_name: to_name.to_string(),
+            reply,
+        })
+        .await
+    }
 }
 
 struct ActorState {
@@ -541,6 +645,79 @@ impl ActorState {
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(out);
+            }
+            Request::HDelete {
+                storage_index,
+                handle,
+                reply,
+            } => {
+                let out = match self.open_storage(storage_index).await {
+                    Ok(st) => st.delete(handle).await.map_err(Error::mtp_msg),
+                    Err(e) => Err(e),
+                };
+                if out.is_ok() {
+                    let sid = self.storage(storage_index).map(|s| s.id.0 as u32).unwrap_or(0);
+                    self.cache.invalidate(sid, 0, None);
+                }
+                let _ = reply.send(out);
+            }
+            Request::HUpload {
+                storage_index,
+                parent,
+                name,
+                size,
+                mut reader,
+                progress,
+                done,
+            } => {
+                let _ = done.send(
+                    self.upload_into(storage_index, parent, &name, size, &mut reader, progress)
+                        .await,
+                );
+            }
+            Request::HMkdir {
+                storage_index,
+                parent,
+                name,
+                reply,
+            } => {
+                let out = match self.open_storage(storage_index).await {
+                    Ok(st) => st
+                        .create_folder(
+                            if parent == ObjectHandle::ROOT {
+                                None
+                            } else {
+                                Some(parent)
+                            },
+                            &name,
+                        )
+                        .await
+                        .map(|h| Entry {
+                            handle: h.0,
+                            parent: parent.0,
+                            name: name.clone(),
+                            is_dir: true,
+                            size: 0,
+                        })
+                        .map_err(Error::mtp_msg),
+                    Err(e) => Err(e),
+                };
+                if out.is_ok() {
+                    let sid = self.storage(storage_index).map(|s| s.id.0 as u32).unwrap_or(0);
+                    self.cache.invalidate(sid, parent.0, None);
+                }
+                let _ = reply.send(out);
+            }
+            Request::HRename {
+                storage_index,
+                from_parent,
+                from_name,
+                to_parent,
+                to_name,
+                reply,
+            } => {
+                let _ = reply
+                    .send(self.rename_handle(storage_index, from_parent, &from_name, to_parent, &to_name).await);
             }
             Request::Storages { reply } => {
                 let _ = reply.send(Ok(self
@@ -613,8 +790,15 @@ impl ActorState {
                 done,
             } => {
                 let _ = done.send(
-                    self.upload(parent, &name, size, &mut reader, progress)
-                        .await,
+                    self.upload_into(
+                        parent.storage_index,
+                        parent.handle,
+                        &name,
+                        size,
+                        &mut reader,
+                        progress,
+                    )
+                    .await,
                 );
             }
         }
@@ -661,7 +845,7 @@ impl ActorState {
         let by_name = self
             .storages
             .iter()
-            .position(|s| s.description.eq_ignore_ascii_case(reference));
+            .position(|s| names_eq_ci(&s.description, reference));
         if let Some(i) = by_name {
             return Ok(i);
         }
@@ -716,7 +900,7 @@ impl ActorState {
     }
 
     fn child_by_name<'e>(entries: &'e [Entry], seg: &str) -> Option<&'e Entry> {
-        entries.iter().find(|e| e.name.eq_ignore_ascii_case(seg))
+        entries.iter().find(|e| names_eq_ci(&e.name, seg))
     }
 
     async fn resolve(&mut self, raw: &str, refresh: bool) -> Result<Resolved> {
@@ -946,6 +1130,64 @@ impl ActorState {
         })
     }
 
+    /// Rename/move by handles within one storage.
+    ///
+    /// Same parent => pure rename. Different parents => move_object then
+    /// rename when the leaf name also changes.
+    #[allow(clippy::too_many_arguments)]
+    async fn rename_handle(
+        &mut self,
+        idx: usize,
+        from_parent: ObjectHandle,
+        from_name: &str,
+        to_parent: ObjectHandle,
+        to_name: &str,
+    ) -> Result<Entry> {
+        // Locate source handle among from_parent children.
+        let entries = self.children_of(idx, from_parent, false).await?;
+        let src = entries
+            .iter()
+            .find(|e| crate::names::names_eq_ci(&e.name, from_name))
+            .cloned()
+            .ok_or_else(|| Error::NotFound(from_name.to_string()))?;
+        let sid = self.storage(idx)?.id;
+
+        let storage = self.open_storage(idx).await?;
+        if from_parent != to_parent {
+            storage
+                .move_object(ObjectHandle(src.handle), to_parent, Some(sid))
+                .await
+                .map_err(Error::mtp_msg)?;
+            self.cache.invalidate(sid.0 as u32, from_parent.0, Some(src.handle));
+            self.cache.invalidate(sid.0 as u32, to_parent.0, None);
+        }
+
+        let final_handle = ObjectHandle(src.handle);
+        if from_name != to_name || from_parent != to_parent {
+            // After a move the object keeps its old name; rename only when needed.
+            if from_name != to_name {
+                storage
+                    .rename(final_handle, to_name)
+                    .await
+                    .map_err(Error::mtp_msg)?;
+                let sid32 = sid.0 as u32;
+                self.cache.invalidate(sid32, to_parent.0, None);
+            }
+        }
+
+        let info = storage
+            .get_object_info(final_handle)
+            .await
+            .map_err(Error::mtp_msg)?;
+        Ok(Entry {
+            handle: info.handle.0,
+            parent: info.parent.0,
+            name: info.filename.clone(),
+            is_dir: info.is_folder(),
+            size: info.size,
+        })
+    }
+
     async fn rename(&mut self, raw: &str, new_name: &str) -> Result<Entry> {
         let p = DevPath::parse(raw)?;
         if p.is_root() || p.segments.is_empty() {
@@ -1069,9 +1311,11 @@ impl ActorState {
         Ok(written)
     }
 
-    async fn upload(
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_into(
         &mut self,
-        parent: Resolved,
+        idx: usize,
+        parent: ObjectHandle,
         name: &str,
         size: u64,
         reader: &mut (dyn AsyncRead + Unpin + Send),
@@ -1114,14 +1358,14 @@ impl ActorState {
                 },
             ));
 
-        let storage = self.open_storage(parent.storage_index).await?;
+        let storage = self.open_storage(idx).await?;
         let info = NewObjectInfo::file(name, size);
         let uploaded = match storage
             .upload(
-                if parent.handle == ObjectHandle::ROOT {
+                if parent == ObjectHandle::ROOT {
                     None
                 } else {
-                    Some(parent.handle)
+                    Some(parent)
                 },
                 info,
                 data,
@@ -1140,11 +1384,8 @@ impl ActorState {
         };
         ticker.abort();
 
-        self.cache.invalidate(
-            self.storage(parent.storage_index)?.id.0 as u32,
-            parent.handle.0,
-            None,
-        );
+        let sid = self.storage(idx)?.id.0 as u32;
+        self.cache.invalidate(sid, parent.0, None);
 
         let oi = storage
             .get_object_info(uploaded)

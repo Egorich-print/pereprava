@@ -15,7 +15,7 @@
 use fernfs::protocol::xdr::nfs3;
 use fernfs::vfs::{Capabilities, DirEntry, NFSFileSystem, ReadDirResult};
 use mtp_rs::ObjectHandle;
-use pereprava_core::{DeviceHandle, StorageSummary};
+use pereprava_core::{names_eq_ci, DeviceHandle, StorageSummary};
 
 const DEVICE_ROOT_ID: u64 = 1;
 const STORAGE_BASE_ID: u64 = 2;
@@ -148,7 +148,7 @@ impl NFSFileSystem for MtpNfs {
             Some(Kind::DeviceRoot) => {
                 let st = self.storages.read().await;
                 for (i, s) in st.iter().enumerate() {
-                    if s.description.eq_ignore_ascii_case(&name) || name == format!("{}", i + 1) {
+                    if names_eq_ci(&s.description, &name) || name == format!("{}", i + 1) {
                         return Ok(STORAGE_BASE_ID + i as u64);
                     }
                 }
@@ -161,7 +161,7 @@ impl NFSFileSystem for MtpNfs {
                     .await
                     .map_err(nfserr)?;
                 for e in entries {
-                    if e.name.eq_ignore_ascii_case(&name) {
+                    if names_eq_ci(&e.name, &name) {
                         return Ok(encode_real(idx, e.handle));
                     }
                 }
@@ -174,7 +174,7 @@ impl NFSFileSystem for MtpNfs {
                     .await
                     .map_err(nfserr)?;
                 for e in entries {
-                    if e.name.eq_ignore_ascii_case(&name) {
+                    if names_eq_ci(&e.name, &name) {
                         return Ok(encode_real(d.storage_index, e.handle));
                     }
                 }
