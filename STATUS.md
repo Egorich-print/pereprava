@@ -4,40 +4,45 @@
 
 ## Current State
 
-**Стадия:** Prototype → Active Development
-**Версия:** 0.1.0 (в разработке)
+**Стадия:** Active Development
+**Версия:** 0.2.0 (в разработке; v0.1.0 тегирован)
 **Дата обновления:** 2026-08-25
 
 ### Готово
 
-- Скаффолд workspace (edition 2024, rust 1.98), CI, доки, ADR-000..003.
-- Изучен и зафиксирован API mtp-rs 0.30 (см. docs/status/mtp-rs-api-notes.md).
-- Симлинк в хабе: `New OpenCode Project/projects/pereprava`.
+- **v0.1.0 (тег)**: CLI `ls/pull/push/mkdir/rm/mv/info/doctor/bench`,
+  device-actor над mtp-rs, graceful close, кэш метаданных, CI.
+  Интеграционный тест на реальном телефоне — зелёный.
+- **Бенчмарки (v0.1.x)**: baseline на Nothing Phone A065 / USB 2.0:
+  большие файлы ~37 MiB/s (предел шины), мелкие ~35 ms/object.
+  → docs/benchmarks/baseline.md
+- **v0.2 bundle-mode**: `pack`/`unpack` (.tar.zst одним объектом),
+  `bench --bundle`. Замер: 500 файлов 21.95s → 0.09s (**233×**).
+  Roundtrip побайтово верифицирован.
 
-### В работе
+### Решения по итогам измерений
 
-- Фаза 2: core (device-actor, кэш) + CLI (ls/pull/push/mkdir/rm/mv/info/doctor).
+- Bundle-mode принят (gate ≥25% из ADR-003 перекрыт в ~900 раз).
+- ADB-zstd транспорт отложен: после bundle-mode его целевой bottleneck
+  перестал доминировать (запись в benchmarks и ADR-003).
 
 ### Не начато
 
-- v0.1.x bench + baseline-замеры на Nothing Phone (2).
-- v0.2 компрессия (bundle-mode / ADB-zstd по автодетекту).
-- v0.3 NFS-mount (вендоренный fernfs).
-- Реестр проектов/Obsidian/showcase (после первого тега).
+- v0.3 NFS-mount через вендоренный fernfs → том в Finder.
 
-## Решения
+### Известные ограничения v0.2
 
-| Решение | Обоснование |
-|---|---|
-| mtp-rs вместо libmtp | чистый async Rust, без FFI, быстрее в 1–4× (ADR-001) |
-| NFSv3 loopback вместо macFUSE/FUSE-T/FSKit | без kext и системных зависимостей (ADR-002) |
-| Компрессия только по данным бенчмарка | ≥25% выигрыша на реальном профиле, иначе cut (ADR-003) |
-| MIT, clean-room rewrite | оригинал GPLv2 не копировался (ADR-000) |
+- `push` дерева поверх существующих имён требует предварительного `rm`
+  (Android отвечает GeneralError на дубли); одиночный файл — `--force`.
+- Распаковка на телефоне не автоматизирована (архив лежит как объект).
+- ptpcamerad может перехватывать устройство между запусками — `doctor`
+  печатает фикс; при жёстком убийстве процесса телефон «клинит» до
+  переключения USB-режима (лечится `svc usb setFunctions mtp` или
+  переустановкой режима передачи на самом телефоне).
 
 ## Risks
 
 | Риск | Митигция |
 |---|---|
-| ptpcamerad перехватывает устройство на macOS | `doctor` + задокументированный фикс |
-| fernfs молод (0.1.5) | вендорим в workspace, патчим локально |
-| Один USB-сеанс на устройство | весь трафик через один device-actor |
+| fernfs молод (для v0.3) | вендорим в workspace, патчим локально |
+| Нестабильные замеры между запусками | методика и числа зафиксированы в docs/benchmarks |

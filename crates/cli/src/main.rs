@@ -1,6 +1,7 @@
 //! pereprava CLI entry point.
 
 mod bench;
+mod bundle;
 mod commands;
 mod doctor;
 mod format;
@@ -73,6 +74,23 @@ enum Cmd {
         /// Small-file count (0 disables the phase).
         #[arg(long, default_value_t = 200)]
         small_files: u32,
+        /// Also push the small-file tree as one .tar.zst bundle and compare.
+        #[arg(long)]
+        bundle: bool,
+    },
+    /// Upload a directory as a single `.tar.zst` object (fast for many files).
+    Pack {
+        /// Local directory to pack.
+        local: String,
+        /// Remote parent directory (default: /1).
+        remote: Option<String>,
+    },
+    /// Download and extract a `.tar.zst` object from the phone.
+    Unpack {
+        /// Remote path to the archive.
+        archive: String,
+        /// Local extraction target directory.
+        dest: String,
     },
 }
 
@@ -110,10 +128,46 @@ async fn main() {
         Cmd::Bench {
             size_mib,
             small_files,
+            bundle,
         } => {
             bench::run(bench::Params {
                 size_mib,
                 small_files,
+                bundle,
+            })
+            .await
+        }
+        Cmd::Pack { local, remote } => {
+            let p = std::path::PathBuf::from(&local);
+            commands::with_device(move |dev| async move {
+                let remote_parent = remote.unwrap_or_else(|| "/1".to_string());
+                let stats = bundle::push_as_bundle(&dev, &p, &remote_parent).await?;
+                println!(
+                    "packed {} file(s), {} dir(s), {} -> {} ({:.2}x smaller) in {:.2}s",
+                    stats.files,
+                    stats.dirs,
+                    format::human_bytes(stats.raw_bytes),
+                    format::human_bytes(stats.packed_bytes),
+                    stats.raw_bytes as f64 / stats.packed_bytes.max(1) as f64,
+                    stats.elapsed_ms as f64 / 1000.0
+                );
+                Ok(())
+            })
+            .await
+        }
+        Cmd::Unpack { archive, dest } => {
+            let d = std::path::PathBuf::from(&dest);
+            commands::with_device(move |dev| async move {
+                let stats = bundle::pull_bundle(&dev, &archive, &d).await?;
+                println!(
+                    "extracted {} file(s) {} (from {}) into {} in {:.2}s",
+                    stats.files,
+                    format::human_bytes(stats.raw_bytes),
+                    format::human_bytes(stats.packed_bytes),
+                    d.display(),
+                    stats.elapsed_ms as f64 / 1000.0
+                );
+                Ok(())
             })
             .await
         }

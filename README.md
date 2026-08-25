@@ -40,19 +40,26 @@ cargo install --path crates/cli
 
 Rust 1.98+ (edition 2024) required. No other dependencies on macOS.
 
-## Usage (v0.1)
+## Usage (v0.2)
 
 ```shell
 pereprava doctor                 # diagnose device access (ptpcamerad, AFT conflicts)
 pereprava info                   # device + storage summary
 pereprava ls [/some/path]        # list directory on the phone
 pereprava pull <remote> [local]  # download file/dir from phone
-pereprava push <local> [remote]  # upload file/dir to phone
+pereprava push <local> [remote]  # upload file/dir to phone (-f replaces)
 pereprava mkdir <remote-dir>
 pereprava mv <src> <dst>         # rename/move on device
 pereprava rm [-r] <remote>       # delete on device
-pereprava bench                  # throughput micro-benchmarks
+
+# many small files? ship them as ONE object (measured 233x on 500 files):
+pereprava pack   <local-dir> [remote-parent]   # -> <name>.tar.zst
+pereprava unpack <remote.tar.zst> <dest-dir>   # extract locally
+
+pereprava bench [--bundle]       # throughput micro-benchmarks
 ```
+
+Numbers and methodology: [docs/benchmarks/baseline.md](docs/benchmarks/baseline.md).
 
 ## macOS note: ptpcamerad
 

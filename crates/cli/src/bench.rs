@@ -16,6 +16,8 @@ pub struct Params {
     pub size_mib: u64,
     /// Number of small files for the metadata-heavy phase.
     pub small_files: u32,
+    /// Also push the small-file tree as one .tar.zst bundle for comparison.
+    pub bundle: bool,
 }
 
 /// Runs the benchmark suite and prints a report table.
@@ -103,6 +105,7 @@ async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Resu
         let t = Instant::now();
         let stats = ops::push_tree(dev, &small_dir, &remote_base).await?;
         let ms = t.elapsed().as_millis();
+        let ms_raw = ms; // kept for the bundle comparison
         let per_file = ms as f64 / f64::from(stats.files.max(1));
         println!(
             "push  {:>8} x {} : {:.2} s total, {per_file:.2} ms/file",
@@ -125,6 +128,31 @@ async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Resu
             entries.len()
         );
         report.push_str(&format!("| list {} entries | {ms} ms |\n", entries.len()));
+
+        // --- Phase 2b: same tree as one bundle (ADR-003 gate) ----------
+        if params.bundle {
+            match crate::bundle::push_as_bundle(dev, &small_dir, &remote_base).await {
+                Ok(b) => {
+                    let bms = b.elapsed_ms.max(1);
+                    println!(
+                        "bundle x {} files : {} -> {} in {:.2}s (raw was {:.2}s => {:.1}x)",
+                        b.files,
+                        crate::format::human_bytes(b.raw_bytes),
+                        crate::format::human_bytes(b.packed_bytes),
+                        bms as f64 / 1000.0,
+                        ms_raw as f64 / 1000.0,
+                        ms_raw as f64 / bms as f64
+                    );
+                    report.push_str(&format!(
+                        "| bundle push | {} files as 1 object | {:.2}s ({:.1}x vs raw) |\n",
+                        b.files,
+                        bms as f64 / 1000.0,
+                        ms_raw as f64 / bms as f64
+                    ));
+                }
+                Err(e) => eprintln!("bundle phase failed: {e}"),
+            }
+        }
     }
 
     // --- Cleanup --------------------------------------------------------

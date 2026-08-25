@@ -21,6 +21,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
+tar = "0.4.46"
+zstd = "0.13.3"
 
 [lints]
 workspace = true
