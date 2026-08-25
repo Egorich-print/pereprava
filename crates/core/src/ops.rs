@@ -60,13 +60,12 @@ async fn pull_tree_inner(
             stats.bytes += sub.bytes;
         } else {
             let file = tokio::fs::File::create(&child_local).await?;
-            let (ptx, _prx) = watch::channel(Progress { total: e.size, done: 0 });
+            let (ptx, _prx) = watch::channel(Progress {
+                total: e.size,
+                done: 0,
+            });
             let n = dev
-                .download_into(
-                    &join_device(remote_dir, &e.name),
-                    Box::new(file),
-                    ptx,
-                )
+                .download_into(&join_device(remote_dir, &e.name), Box::new(file), ptx)
                 .await?;
             stats.files += 1;
             stats.bytes += n;
@@ -88,10 +87,12 @@ pub async fn push_tree(
     let name = local_dir
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| crate::error::Error::InvalidArgument(format!(
-            "cannot derive a directory name from {}",
-            local_dir.display()
-        )))?;
+        .ok_or_else(|| {
+            crate::error::Error::InvalidArgument(format!(
+                "cannot derive a directory name from {}",
+                local_dir.display()
+            ))
+        })?;
     let remote_here = join_device(remote_parent, name);
     dev.mkdir_all(&remote_here).await?;
 

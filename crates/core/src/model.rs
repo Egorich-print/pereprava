@@ -83,7 +83,10 @@ mod tests {
 
     #[test]
     fn progress_pct_saturates() {
-        let p = Progress { total: 10, done: 99 };
+        let p = Progress {
+            total: 10,
+            done: 99,
+        };
         assert!((p.pct() - 100.0).abs() < f64::EPSILON);
     }
 

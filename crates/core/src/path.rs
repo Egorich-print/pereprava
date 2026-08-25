@@ -85,8 +85,7 @@ mod tests {
 
     #[test]
     fn parses_storage_and_segments() {
-        let p = DevPath::parse("/Internal shared storage/DCIM/Camera")
-            .expect("parse failed");
+        let p = DevPath::parse("/Internal shared storage/DCIM/Camera").expect("parse failed");
         assert_eq!(p.storage_ref, "Internal shared storage");
         assert_eq!(p.segments, vec!["DCIM".to_string(), "Camera".to_string()]);
         assert!(!p.is_root());

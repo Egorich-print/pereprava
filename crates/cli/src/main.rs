@@ -1,6 +1,126 @@
-//! pereprava CLI entry point (placeholder, filled in phase 2b).
+//! pereprava CLI entry point.
 
-fn main() -> anyhow::Result<()> {
-    println!("pereprava scaffold");
-    Ok(())
+mod bench;
+mod commands;
+mod doctor;
+mod format;
+mod progress;
+
+use clap::{Parser, Subcommand};
+
+/// Modern async MTP client for macOS — Android <-> Mac file transfer.
+#[derive(Parser)]
+#[command(name = "pereprava", version, about)]
+struct Cli {
+    /// Enable verbose logging (RUST_LOG style filtering).
+    #[arg(long, global = true)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Diagnose device visibility and common blockers (ptpcamerad, AFT, adb).
+    Doctor,
+    /// Show device and storage summary.
+    Info,
+    /// List a device directory (`/` lists storages).
+    Ls {
+        /// Device path, e.g. "/Internal shared storage/DCIM".
+        #[arg(default_value_t = String::from("/"))]
+        path: String,
+    },
+    /// Download a file or directory from the phone.
+    Pull {
+        /// Remote path to download.
+        remote: String,
+        /// Local destination (default: current directory).
+        local: Option<String>,
+    },
+    /// Upload a file or directory to the phone.
+    Push {
+        /// Local source path.
+        local: String,
+        /// Remote parent directory (default: /1 — first storage root).
+        remote: Option<String>,
+        /// Replace an existing remote file instead of failing.
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
+    /// Create a directory on the phone (parents included).
+    Mkdir { path: String },
+    /// Delete a file or directory on the phone.
+    Rm {
+        path: String,
+        /// Delete directories recursively.
+        #[arg(short = 'r', long)]
+        recursive: bool,
+    },
+    /// Move/rename on the phone.
+    Mv {
+        /// Source device path.
+        from: String,
+        /// Destination directory or full new path.
+        to: String,
+    },
+    /// Throughput micro-benchmarks (artifacts are cleaned up).
+    Bench {
+        /// Big-file size in MiB (0 disables the phase).
+        #[arg(long, default_value_t = 64)]
+        size_mib: u64,
+        /// Small-file count (0 disables the phase).
+        #[arg(long, default_value_t = 200)]
+        small_files: u32,
+    },
+}
+
+fn init_logging(verbose: bool) {
+    use tracing_subscriber::EnvFilter;
+    let filter = if verbose {
+        EnvFilter::new("pereprava=trace,mtp_rs=info,nusb=info")
+    } else {
+        EnvFilter::new("pereprava=warn")
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    init_logging(cli.verbose);
+
+    let result = match cli.cmd {
+        Cmd::Doctor => doctor::run().await,
+        Cmd::Info => commands::info().await,
+        Cmd::Ls { path } => commands::ls(&path).await,
+        Cmd::Pull { remote, local } => commands::pull(remote, local).await,
+        Cmd::Push {
+            local,
+            remote,
+            force,
+        } => commands::push(local, remote, force).await,
+        Cmd::Mkdir { path } => commands::mkdir(path).await,
+        Cmd::Rm { path, recursive } => commands::rm(path, recursive).await,
+        Cmd::Mv { from, to } => commands::mv(from, to).await,
+        Cmd::Bench {
+            size_mib,
+            small_files,
+        } => {
+            bench::run(bench::Params {
+                size_mib,
+                small_files,
+            })
+            .await
+        }
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
 }

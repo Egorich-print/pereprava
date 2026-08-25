@@ -7,13 +7,13 @@
 //! parallel.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use mtp_rs::mtp::{ByteRange, MtpDevice, NewObjectInfo};
 use mtp_rs::ObjectHandle;
+use mtp_rs::mtp::{ByteRange, MtpDevice, NewObjectInfo};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -47,6 +47,8 @@ pub struct Resolved {
 }
 
 enum Request {
+    /// Stops the actor loop and closes the device session.
+    Shutdown,
     Info {
         reply: oneshot::Sender<Result<DeviceSummary>>,
     },
@@ -99,6 +101,7 @@ enum Request {
 #[derive(Clone)]
 pub struct DeviceHandle {
     tx: mpsc::Sender<Request>,
+    finished: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>>,
 }
 
 /// USB-level probe result used by `doctor` before any session is opened.
@@ -176,9 +179,7 @@ impl DeviceHandle {
     /// Propagates transport/session errors from mtp-rs (exclusive access,
     /// no device plugged, ...).
     pub async fn connect_first() -> Result<Self> {
-        let device = MtpDevice::open_first()
-            .await
-            .map_err(Error::mtp_msg)?;
+        let device = MtpDevice::open_first().await.map_err(Error::mtp_msg)?;
 
         let mut storages = Vec::new();
         for s in device.storages().await.map_err(Error::mtp_msg)? {
@@ -193,19 +194,45 @@ impl DeviceHandle {
         }
 
         let (tx, rx) = mpsc::channel::<Request>(16);
+        let (done_tx, done_rx) = oneshot::channel::<()>();
         let state = ActorState {
             device,
             storages,
             cache: MetaCache::new(),
         };
-        tokio::spawn(state.run(rx));
-        Ok(Self { tx })
+        tokio::spawn(async move {
+            state.run(rx).await;
+            // Signal completion so `DeviceHandle::close` can await a clean
+            // session teardown even across process lifetimes.
+            let _ = done_tx.send(());
+        });
+        Ok(Self {
+            tx,
+            finished: Arc::new(tokio::sync::Mutex::new(Some(done_rx))),
+        })
     }
 
-    async fn call<R>(
-        &self,
-        make: impl FnOnce(oneshot::Sender<Result<R>>) -> Request,
-    ) -> Result<R> {
+    /// Gracefully stops the actor and closes the MTP session.
+    ///
+    /// Skipping this (e.g. on hard process exit) leaves Android's MTP server
+    /// wedged and the *next* connection attempt will time out until the USB
+    /// function is toggled.
+    ///
+    /// # Errors
+    /// Returns protocol errors from session close, if any.
+    pub async fn close(&self) -> Result<()> {
+        self.tx
+            .send(Request::Shutdown)
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        let mut slot = self.finished.lock().await;
+        if let Some(rx) = slot.take() {
+            let _ = rx.await;
+        }
+        Ok(())
+    }
+
+    async fn call<R>(&self, make: impl FnOnce(oneshot::Sender<Result<R>>) -> Request) -> Result<R> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(make(tx))
@@ -343,15 +370,22 @@ struct ActorState {
 
 impl ActorState {
     async fn run(mut self, mut rx: mpsc::Receiver<Request>) {
-        while let Some(req) = rx.recv().await {
-            self.dispatch(req).await;
+        let mut running = true;
+        while running {
+            match rx.recv().await {
+                Some(Request::Shutdown) | None => running = false,
+                Some(req) => self.dispatch(req).await,
+            }
         }
-        tracing::debug!("actor: channel closed, closing device session");
-        drop(self.device.close().await);
+        tracing::debug!("actor: shutting down, closing device session");
+        if let Err(e) = self.device.close().await {
+            tracing::warn!("device close reported: {e}");
+        }
     }
 
     async fn dispatch(&mut self, req: Request) {
         match req {
+            Request::Shutdown => {} // handled by the run loop
             Request::Info { reply } => {
                 let _ = reply.send(Ok(self.summary()));
             }
@@ -444,9 +478,9 @@ impl ActorState {
     }
 
     fn storage(&self, idx: usize) -> Result<&StorageRec> {
-        self.storages.get(idx).ok_or_else(|| {
-            Error::InvalidArgument(format!("storage index {idx} out of range"))
-        })
+        self.storages
+            .get(idx)
+            .ok_or_else(|| Error::InvalidArgument(format!("storage index {idx} out of range")))
     }
 
     async fn open_storage(&self, idx: usize) -> Result<mtp_rs::mtp::Storage> {
@@ -468,7 +502,11 @@ impl ActorState {
         {
             return Ok(n - 1);
         }
-        let known: Vec<&str> = self.storages.iter().map(|s| s.description.as_str()).collect();
+        let known: Vec<&str> = self
+            .storages
+            .iter()
+            .map(|s| s.description.as_str())
+            .collect();
         Err(Error::NotFound(format!(
             "storage '{reference}' (known: {known:?}, or use 1-based index)"
         )))
@@ -482,9 +520,7 @@ impl ActorState {
         refresh: bool,
     ) -> Result<Vec<Entry>> {
         let sid = self.storage(idx)?.id.0 as u32;
-        if !refresh
-            && let Some(hit) = self.cache.listing(sid, dir.0)
-        {
+        if !refresh && let Some(hit) = self.cache.listing(sid, dir.0) {
             return Ok(hit.to_vec());
         }
         let storage = self.open_storage(idx).await?;
@@ -552,10 +588,7 @@ impl ActorState {
         }
         // Authoritative metadata straight from the device.
         let storage = self.open_storage(idx).await?;
-        let oi = storage
-            .get_object_info(cur)
-            .await
-            .map_err(Error::mtp_msg)?;
+        let oi = storage.get_object_info(cur).await.map_err(Error::mtp_msg)?;
         Ok(Resolved {
             storage_index: idx,
             handle: cur,
@@ -585,12 +618,31 @@ impl ActorState {
                 })
                 .collect());
         }
+        // Resolve the FULL path: listing a directory means listing *its*
+        // children, so walk every segment down to the directory itself.
         let idx = self.find_storage_index(&p.storage_ref)?;
-        if p.segments.is_empty() {
-            return self.children_of(idx, ObjectHandle::ROOT, refresh).await;
+        let mut cur = ObjectHandle::ROOT;
+        for (depth, seg) in p.segments.iter().enumerate() {
+            let entries = self.children_of(idx, cur, refresh).await?;
+            match Self::child_by_name(&entries, seg) {
+                Some(e) if e.is_dir => cur = ObjectHandle(e.handle),
+                Some(_) => {
+                    let walked: String = std::iter::once(p.storage_ref.clone())
+                        .chain(p.segments.iter().take(depth + 1).cloned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    return Err(Error::WrongKind(format!("/{walked} is not a directory")));
+                }
+                None => {
+                    let walked: String = std::iter::once(p.storage_ref.clone())
+                        .chain(p.segments.iter().take(depth + 1).cloned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    return Err(Error::NotFound(format!("/{walked}")));
+                }
+            }
         }
-        let parent = self.walk_to_parent(&p, idx).await?;
-        self.children_of(idx, parent, refresh).await
+        self.children_of(idx, cur, refresh).await
     }
 
     /// Walks all but the last segment; returns the handle of the parent dir.
@@ -802,7 +854,8 @@ impl ActorState {
             .await
             .map_err(Error::mtp_msg)?;
 
-        self.cache.invalidate(sid_u32, src_parent.0, Some(target.handle));
+        self.cache
+            .invalidate(sid_u32, src_parent.0, Some(target.handle));
         self.cache.invalidate(sid_u32, dst_dir.handle.0, None);
 
         let info = storage
@@ -855,7 +908,10 @@ impl ActorState {
         reader: &mut (dyn AsyncRead + Unpin + Send),
         progress: watch::Sender<Progress>,
     ) -> Result<Entry> {
-        progress.send_replace(Progress { total: size, done: 0 });
+        progress.send_replace(Progress {
+            total: size,
+            done: 0,
+        });
 
         let counter = Arc::new(AtomicU64::new(0));
         let counting = CountingReader {
@@ -864,44 +920,44 @@ impl ActorState {
         };
         let ticker = spawn_progress_ticker(counter, size, progress);
 
-        let data: Pin<
-            Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + '_>,
-        > = Box::pin(futures::stream::unfold(
-            ReadState {
-                reader: counting,
-                buf: vec![0u8; UPLOAD_CHUNK],
-                eof: false,
-            },
-            |mut st| async move {
-                if st.eof {
-                    return None;
-                }
-                match st.reader.read(&mut st.buf).await {
-                    Ok(0) => {
-                        st.eof = true;
-                        Some((Ok(bytes::Bytes::new()), st))
+        let data: Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + '_>> =
+            Box::pin(futures::stream::unfold(
+                ReadState {
+                    reader: counting,
+                    buf: vec![0u8; UPLOAD_CHUNK],
+                    eof: false,
+                },
+                |mut st| async move {
+                    if st.eof {
+                        return None;
                     }
-                    Ok(n) => Some((Ok(bytes::Bytes::copy_from_slice(&st.buf[..n])), st)),
-                    Err(e) => {
-                        st.eof = true;
-                        Some((Err(e), st))
+                    match st.reader.read(&mut st.buf).await {
+                        Ok(0) => {
+                            st.eof = true;
+                            Some((Ok(bytes::Bytes::new()), st))
+                        }
+                        Ok(n) => Some((Ok(bytes::Bytes::copy_from_slice(&st.buf[..n])), st)),
+                        Err(e) => {
+                            st.eof = true;
+                            Some((Err(e), st))
+                        }
                     }
-                }
-            },
-        ));
+                },
+            ));
 
         let storage = self.open_storage(parent.storage_index).await?;
         let info = NewObjectInfo::file(name, size);
-        let uploaded = match storage.upload(
-            if parent.handle == ObjectHandle::ROOT {
-                None
-            } else {
-                Some(parent.handle)
-            },
-            info,
-            data,
-        )
-        .await
+        let uploaded = match storage
+            .upload(
+                if parent.handle == ObjectHandle::ROOT {
+                    None
+                } else {
+                    Some(parent.handle)
+                },
+                info,
+                data,
+            )
+            .await
         {
             Ok(h) => h,
             Err(ue) => {
@@ -915,8 +971,11 @@ impl ActorState {
         };
         ticker.abort();
 
-        self.cache
-            .invalidate(self.storage(parent.storage_index)?.id.0 as u32, parent.handle.0, None);
+        self.cache.invalidate(
+            self.storage(parent.storage_index)?.id.0 as u32,
+            parent.handle.0,
+            None,
+        );
 
         let oi = storage
             .get_object_info(uploaded)
