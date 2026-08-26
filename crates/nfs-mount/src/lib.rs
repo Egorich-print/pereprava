@@ -11,5 +11,5 @@ pub mod mount;
 /// the vendored path dependency itself.
 pub use fernfs;
 
-pub use adapter::MtpNfs;
+pub use adapter::{MtpNfs, SharedMtpNfs};
 pub use mount::{mount, unmount};

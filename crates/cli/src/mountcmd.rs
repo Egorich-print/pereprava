@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use pereprava_core::DeviceHandle;
 use pereprava_nfs::MtpNfs;
 
 /// Mounts the connected device at `path` and serves until Ctrl-C.
@@ -79,4 +80,104 @@ pub async fn detach(path: PathBuf) -> Result<()> {
         bail!("{} does not exist", path.display());
     }
     pereprava_nfs::unmount(&path).await
+}
+
+/// `watch` — keep the phone's volume alive across connect/disconnect cycles.
+///
+/// The NFS listener and the macOS mount point are established once; MTP
+/// sessions rotate underneath (`MtpNfs::attach/detach`). Because the adapter
+/// generation never changes, kernel filehandles survive every rotation and
+/// no additional admin prompts appear after the very first mount.
+#[allow(clippy::too_many_arguments)]
+pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) -> Result<()> {
+    use std::sync::Arc;
+
+    use pereprava_core::actor;
+
+    let nfs =
+        std::sync::Arc::new(MtpNfs::new_detached(!read_only).context("preparing the NFS adapter")?);
+    let shared = pereprava_nfs::SharedMtpNfs(nfs.clone());
+
+    let listener =
+        pereprava_nfs::fernfs::tcp::NFSTcpListener::bind(&format!("127.0.0.1:{port}"), shared)
+            .await
+            .with_context(|| format!("binding NFS server on 127.0.0.1:{port}"))?;
+    let server = tokio::spawn(async move {
+        use pereprava_nfs::fernfs::tcp::NFSTcp;
+        if let Err(e) = listener.handle_forever().await {
+            tracing::error!("nfs server stopped: {e}");
+        }
+    });
+
+    println!("watch: NFS ready on 127.0.0.1:{port}; polling for a phone every {poll_secs}s");
+
+    let poll = std::time::Duration::from_secs(poll_secs);
+    let mut mounted = false;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(poll) => {}
+        }
+
+        if !nfs.is_attached() {
+            // ptpcamerad re-claims freshly plugged MTP devices within
+            // seconds; suppress it around our own connect attempt.
+            let _ = tokio::process::Command::new("pkill")
+                .args(["-9", "ptpcamerad"])
+                .output()
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            match DeviceHandle::connect_first().await {
+                Ok(dev) => {
+                    let model = dev
+                        .info()
+                        .await
+                        .ok()
+                        .and_then(|i| i.product)
+                        .unwrap_or_else(|| "unknown".into());
+                    if let Err(e) = nfs.attach(dev.clone()).await {
+                        eprintln!("attach failed: {e}");
+                        drop(dev.close().await);
+                        continue;
+                    }
+                    println!("phone attached ({model})");
+                    if !mounted {
+                        match pereprava_nfs::mount(port, &path).await {
+                            Ok(used) => {
+                                mounted = true;
+                                println!(
+                                    "volume mounted at {} — reconnects are prompt-free",
+                                    used.display()
+                                );
+                            }
+                            Err(e) => {
+                                // Back off hard: osascript prompts stack otherwise.
+                                eprintln!(
+                                    "mount failed ({e});\n  fix: sudo umount -f {path:?} && rerun, \
+                                     or install autorun via scripts/install-autorun.sh"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("connect failed: {e}"),
+            }
+        } else {
+            // Liveness = does the SESSION still answer? Bus enumeration lies
+            // (charge-only mode, unrelated USB gadgets), the session doesn't.
+            let alive = {
+                let dev_ok = nfs.test_session().await;
+                dev_ok
+            };
+            if !alive {
+                println!("phone gone: session paused (volume stays mounted)");
+                nfs.detach();
+            }
+        }
+    }
+
+    println!("watch stopped: detaching session (volume left as-is)");
+    server.abort();
+    Ok(())
 }

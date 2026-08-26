@@ -4,33 +4,55 @@
 //! (works when already root) and otherwise ask via `osascript`, which pops
 //! the system GUI password dialog — once per mount.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-/// Attaches `127.0.0.1:/` at `mount_point` using NFSv3 over TCP loopback.
-pub async fn mount(port: u16, mount_point: &Path) -> Result<()> {
-    let mp = mount_point.display();
-    // `soft` keeps a dead phone from wedging the volume permanently
-    // (hard NFS + vanished USB = unkillable mount); retries stay modest.
-    let script = format!(
-        "mkdir -p '{mp}' && /sbin/mount_nfs -o soft,nolocks,vers=3,tcp,rsize=131072,wsize=131072,retry=1,retrans=2,timeo=50,port={port},mountport={port} 127.0.0.1:/ '{mp}'"
-    );
-    if sh("/bin/sh", &["-c", &script]).await.is_ok() {
-        return Ok(());
+/// Attaches `127.0.0.1:/` near `mount_point` using NFSv3 over TCP loopback.
+///
+/// Returns the path actually used: when the requested point is occupied by
+/// a stale/hung mount (kernel keeps ghost entries until reboot or explicit
+/// root umount), we automatically fall back to `-2`, `-3`, ... so watchers
+/// never wedge on leftovers they cannot remove without root.
+pub async fn mount(port: u16, mount_point: &Path) -> Result<PathBuf> {
+    let mut candidate = mount_point.to_path_buf();
+    for attempt in 1..=9u32 {
+        let mp = candidate.display();
+        // `soft` keeps a dead phone from wedging the volume permanently
+        // (hard NFS + vanished USB = unkillable mount); retries stay modest.
+        let script = format!(
+            "mkdir -p '{mp}' && /sbin/mount_nfs -o soft,nolocks,vers=3,tcp,rsize=131072,wsize=131072,retry=1,retrans=2,timeo=50,port={port},mountport={port} 127.0.0.1:/ '{mp}'"
+        );
+        if sh("/bin/sh", &["-c", &script]).await.is_ok() {
+            return Ok(candidate);
+        }
+        // Not root: ask through the system dialog.
+        let escaped = script.replace('\\', "\\\\").replace('"', "\\\"");
+        if sh(
+            "/usr/bin/osascript",
+            &[
+                "-e",
+                &format!("do shell script \"{escaped}\" with administrator privileges"),
+            ],
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(candidate);
+        }
+        candidate = mount_point.with_extension(format!("{}-{attempt}", ext_of(mount_point)));
+        tracing::debug!(path=%candidate.display(), "mount fallback attempt");
     }
-    // Not root: ask through the system dialog.
-    let escaped = script.replace('\\', "\\\\").replace('"', "\\\"");
-    sh(
-        "/usr/bin/osascript",
-        &[
-            "-e",
-            &format!("do shell script \"{escaped}\" with administrator privileges"),
-        ],
+    bail!(
+        "could not mount near {} (all fallback paths exhausted)",
+        mount_point.display()
     )
-    .await
-    .context("mount_nfs needs administrator rights (GUI prompt was declined or failed)")?;
-    Ok(())
+}
+
+fn ext_of(p: &Path) -> String {
+    p.extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 /// Detaches `mount_point`.

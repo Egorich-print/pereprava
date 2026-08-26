@@ -120,6 +120,21 @@ enum Cmd {
         #[arg(long, default_value = "/Volumes/pereprava")]
         path: String,
     },
+    /// Daemon: auto-mount whenever a phone appears (for LaunchAgent).
+    Watch {
+        /// Mount point.
+        #[arg(long, default_value = "/Volumes/pereprava")]
+        path: String,
+        /// Local TCP port for the loopback NFS server.
+        #[arg(long, default_value_t = 34567)]
+        port: u16,
+        /// Force read-only even when the device storage is writable.
+        #[arg(long)]
+        read_only: bool,
+        /// Polling interval in seconds.
+        #[arg(long, default_value_t = 3)]
+        poll_secs: u64,
+    },
 }
 
 fn init_logging(verbose: bool) {
@@ -223,6 +238,12 @@ async fn main() {
             .await
         }
         Cmd::Unmount { path } => mountcmd::detach(std::path::PathBuf::from(path)).await,
+        Cmd::Watch {
+            path,
+            port,
+            read_only,
+            poll_secs,
+        } => mountcmd::watch(std::path::PathBuf::from(path), port, read_only, poll_secs).await,
     };
 
     if let Err(e) = result {

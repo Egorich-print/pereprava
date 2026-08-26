@@ -44,7 +44,9 @@ struct Stage {
 }
 
 /// NFS view of one connected MTP device.
-pub struct MtpNfs {
+/// Shared inner state; `MtpNfs` is a cheap handle (Clone) so watchers can
+/// keep copies while fernfs owns another one.
+struct Inner {
     /// Rotating session: `None` while the phone is absent. The listener and
     /// file-id space live across rotations (generation stays stable), so the
     /// kernel keeps its filehandles.
@@ -55,6 +57,12 @@ pub struct MtpNfs {
     staged: Mutex<HashMap<u64, Stage>>,
     virt_seq: Mutex<u64>,
     tmp_dir: PathBuf,
+}
+
+/// Cheap clonable NFS view of one MTP device.
+#[derive(Clone)]
+pub struct MtpNfs {
+    inner: std::sync::Arc<Inner>,
 }
 
 fn nfserr(e: pereprava_core::Error) -> nfs3::nfsstat3 {
@@ -111,31 +119,44 @@ fn decode(id: u64) -> Option<Kind> {
 }
 
 impl MtpNfs {
-    /// Builds the adapter and snapshots the storage table once.
+    /// Session-less constructor for long-lived watchers; call [`attach`]
+    /// when a device shows up.
     ///
     /// # Errors
-    /// Fails when the actor reports no storages.
-    pub async fn new(dev: DeviceHandle, writable: bool) -> Result<Self, pereprava_core::Error> {
-        let storages = dev.storages().await?;
+    /// Only fails when the staging temp directory cannot be created.
+    pub fn new_detached(writable: bool) -> Result<Self, pereprava_core::Error> {
         let tmp_dir = std::env::temp_dir().join(format!("pereprava-nfs-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).map_err(pereprava_core::Error::Io)?;
         Ok(Self {
-            sess: std::sync::RwLock::new(Some(dev)),
-            storages: tokio::sync::RwLock::new(storages),
-            epoch: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or_default(),
-            writable,
-            staged: Mutex::new(HashMap::new()),
-            virt_seq: Mutex::new(0),
-            tmp_dir,
+            inner: std::sync::Arc::new(Inner {
+                sess: std::sync::RwLock::new(None),
+                storages: tokio::sync::RwLock::new(Vec::new()),
+                epoch: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or_default(),
+                writable,
+                staged: Mutex::new(HashMap::new()),
+                virt_seq: Mutex::new(0),
+                tmp_dir,
+            }),
         })
+    }
+
+    /// Classic constructor: detached + immediate attach.
+    ///
+    /// # Errors
+    /// Propagates session errors from the device.
+    pub async fn new(dev: DeviceHandle, writable: bool) -> Result<Self, pereprava_core::Error> {
+        let nfs = Self::new_detached(writable)?;
+        nfs.attach(dev).await?;
+        Ok(nfs)
     }
 
     /// Next virtual id for a created-but-unflushed file.
     fn next_virt_id(&self) -> u64 {
         let mut seq = self
+            .inner
             .virt_seq
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -144,13 +165,13 @@ impl MtpNfs {
     }
 
     fn tmp_path_for(&self, id: u64) -> PathBuf {
-        self.tmp_dir.join(format!("stage-{id:016x}.bin"))
+        self.inner.tmp_dir.join(format!("stage-{id:016x}.bin"))
     }
 
     /// Resolves the device handle for an NFS id, preferring flushed stage
     /// mappings over the static encoding.
     fn device_handle_of(&self, id: u64) -> Option<(usize, ObjectHandle)> {
-        if let Ok(st) = self.staged.lock()
+        if let Ok(st) = self.inner.staged.lock()
             && let Some(s) = st.get(&id)
         {
             return s.flushed_dev.map(|h| (s.storage_index, ObjectHandle(h)));
@@ -176,7 +197,7 @@ impl MtpNfs {
 
     /// Finds a staged entry whose parent+name matches; returns its id.
     fn staged_lookup(&self, dir_id: u64, name: &str) -> Option<u64> {
-        let st = self.staged.lock().ok()?;
+        let st = self.inner.staged.lock().ok()?;
         st.iter()
             .find(|(_, s)| s.parent_id == dir_id && names_eq_ci(&s.name, name))
             .map(|(id, _)| *id)
@@ -193,7 +214,11 @@ impl MtpNfs {
         size: u64,
     ) -> Result<(), nfs3::nfsstat3> {
         {
-            let st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            let st = self
+                .inner
+                .staged
+                .lock()
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
             if st.contains_key(&id) {
                 return Ok(());
             }
@@ -221,7 +246,11 @@ impl MtpNfs {
         }
         out.sync_all().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
         drop(out);
-        let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        let mut st = self
+            .inner
+            .staged
+            .lock()
+            .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
         st.insert(
             id,
             Stage {
@@ -244,7 +273,7 @@ impl MtpNfs {
         dirid: u64,
         filename: &nfs3::filename3,
     ) -> Result<u64, nfs3::nfsstat3> {
-        if !self.writable {
+        if !self.inner.writable {
             return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
         }
         self.parent_handle_of(dirid)?;
@@ -259,7 +288,11 @@ impl MtpNfs {
                 .map(|(idx, h)| (dev_id, idx, h))
         });
 
-        let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        let mut st = self
+            .inner
+            .staged
+            .lock()
+            .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
 
         // Reuse an already-staged entry with the same name.
         for (vid, s) in st.iter_mut() {
@@ -312,10 +345,10 @@ impl MtpNfs {
 
     /// Guarantees a staging slot exists for `id` before writes are applied.
     async fn stage_for_writes(&self, id: u64) -> Result<(), nfs3::nfsstat3> {
-        if !self.writable {
+        if !self.inner.writable {
             return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
         }
-        if let Ok(st) = self.staged.lock()
+        if let Ok(st) = self.inner.staged.lock()
             && st.contains_key(&id)
         {
             return Ok(());
@@ -341,7 +374,11 @@ impl MtpNfs {
     /// the local copy, remember the new handle.
     async fn flush_stage(&self, id: u64) -> Result<(), nfs3::nfsstat3> {
         let snapshot = {
-            let st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            let st = self
+                .inner
+                .staged
+                .lock()
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
             st.get(&id).map(|s| {
                 (
                     s.tmp.clone(),
@@ -379,7 +416,11 @@ impl MtpNfs {
             .await
             .map_err(nfserr)?;
 
-        let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        let mut st = self
+            .inner
+            .staged
+            .lock()
+            .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
         if let Some(s) = st.get_mut(&id) {
             s.flushed_dev = Some(new_entry.handle);
             s.dirty = false;
@@ -390,7 +431,7 @@ impl MtpNfs {
 
     /// Snapshot of the current session handle (sync clone; no await held).
     fn dev(&self) -> Result<DeviceHandle, nfs3::nfsstat3> {
-        match self.sess.read() {
+        match self.inner.sess.read() {
             Ok(g) => g.clone().ok_or(nfs3::nfsstat3::NFS3ERR_IO),
             Err(_) => Err(nfs3::nfsstat3::NFS3ERR_IO),
         }
@@ -399,8 +440,9 @@ impl MtpNfs {
     /// Installs a fresh session (device just connected).
     pub async fn attach(&self, dev: DeviceHandle) -> Result<(), pereprava_core::Error> {
         let storages = dev.storages().await?;
-        *self.storages.write().await = storages;
+        *self.inner.storages.write().await = storages;
         *self
+            .inner
             .sess
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dev);
@@ -410,14 +452,29 @@ impl MtpNfs {
     /// Drops the session (device gone). Staged files are kept on disk.
     pub fn detach(&self) {
         *self
+            .inner
             .sess
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
+    /// Whether a device session is currently installed.
+    #[must_use]
+    pub fn is_attached(&self) -> bool {
+        self.inner.sess.read().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Cheap session health probe: `true` when the device answers GetDeviceInfo.
+    pub async fn test_session(&self) -> bool {
+        let Some(dev) = self.inner.sess.read().ok().and_then(|g| g.clone()) else {
+            return false;
+        };
+        matches!(dev.info().await, Ok(_))
+    }
+
     fn attr_for(&self, id: u64, is_dir: bool, size: u64) -> nfs3::fattr3 {
         let t = nfs3::nfstime3 {
-            seconds: self.epoch,
+            seconds: self.inner.epoch,
             nseconds: 0,
         };
         nfs3::fattr3 {
@@ -448,11 +505,11 @@ impl MtpNfs {
 #[async_trait::async_trait]
 impl NFSFileSystem for MtpNfs {
     fn generation(&self) -> u64 {
-        u64::from(self.epoch)
+        u64::from(self.inner.epoch)
     }
 
     fn capabilities(&self) -> Capabilities {
-        if self.writable {
+        if self.inner.writable {
             Capabilities::ReadWrite
         } else {
             Capabilities::ReadOnly
@@ -472,7 +529,7 @@ impl NFSFileSystem for MtpNfs {
         tracing::debug!("NFSLOOKUP dirid={:#x} name={:?} -> ", dirid, name);
         match decode(dirid) {
             Some(Kind::DeviceRoot) => {
-                let st = self.storages.read().await;
+                let st = self.inner.storages.read().await;
                 for (i, s) in st.iter().enumerate() {
                     if names_eq_ci(&s.description, &name) || name == format!("{}", i + 1) {
                         return Ok(STORAGE_BASE_ID + i as u64);
@@ -505,7 +562,7 @@ impl NFSFileSystem for MtpNfs {
     }
 
     async fn getattr(&self, id: nfs3::fileid3) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
-        if let Ok(st) = self.staged.lock()
+        if let Ok(st) = self.inner.staged.lock()
             && let Some(s) = st.get(&id)
         {
             return Ok(self.attr_for(id, false, s.size));
@@ -513,7 +570,7 @@ impl NFSFileSystem for MtpNfs {
         match decode(id) {
             Some(Kind::DeviceRoot) => Ok(self.attr_for(id, true, 0)),
             Some(Kind::StorageRoot(idx)) => {
-                let st = self.storages.read().await;
+                let st = self.inner.storages.read().await;
                 match st.get(idx) {
                     Some(s) => Ok(self.attr_for(id, true, s.capacity - s.free)),
                     None => Err(nfs3::nfsstat3::NFS3ERR_BADHANDLE),
@@ -533,7 +590,7 @@ impl NFSFileSystem for MtpNfs {
         id: nfs3::fileid3,
         setattr: nfs3::sattr3,
     ) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
-        if !self.writable {
+        if !self.inner.writable {
             return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
         }
         // Only size changes are meaningful on MTP objects.
@@ -544,7 +601,11 @@ impl NFSFileSystem for MtpNfs {
         // Ensure the file is staged (pull current copy when it exists).
         self.stage_for_writes(id).await?;
         {
-            let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            let mut st = self
+                .inner
+                .staged
+                .lock()
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
             if let Some(s) = st.get_mut(&id) {
                 let f = std::fs::OpenOptions::new()
                     .write(true)
@@ -569,7 +630,11 @@ impl NFSFileSystem for MtpNfs {
         // Staged copy wins: it may be dirty or newer than the device.
         {
             use std::io::{Read, Seek, SeekFrom};
-            let st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            let st = self
+                .inner
+                .staged
+                .lock()
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
             if let Some(s) = st.get(&id) {
                 let mut f = std::fs::File::open(&s.tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
                 let total = f.metadata().map(|m| m.len()).unwrap_or(s.size);
@@ -612,13 +677,17 @@ impl NFSFileSystem for MtpNfs {
         data: &[u8],
         stable: fernfs::protocol::xdr::nfs3::file::stable_how,
     ) -> Result<(nfs3::fattr3, nfs3::file::stable_how, nfs3::count3), nfs3::nfsstat3> {
-        if !self.writable {
+        if !self.inner.writable {
             return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
         }
         self.stage_for_writes(id).await?;
         {
             use std::io::{Seek, SeekFrom, Write};
-            let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            let mut st = self
+                .inner
+                .staged
+                .lock()
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
             let s = st.get_mut(&id).ok_or(nfs3::nfsstat3::NFS3ERR_NOENT)?;
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -667,7 +736,7 @@ impl NFSFileSystem for MtpNfs {
         dirid: nfs3::fileid3,
         dirname: &nfs3::filename3,
     ) -> Result<(nfs3::fileid3, nfs3::fattr3), nfs3::nfsstat3> {
-        if !self.writable {
+        if !self.inner.writable {
             return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
         }
         let name = String::from_utf8_lossy(dirname).to_string();
@@ -683,14 +752,14 @@ impl NFSFileSystem for MtpNfs {
         dirid: nfs3::fileid3,
         filename: &nfs3::filename3,
     ) -> Result<(), nfs3::nfsstat3> {
-        if !self.writable {
+        if !self.inner.writable {
             return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
         }
         let name = String::from_utf8_lossy(filename).to_string();
 
         // Staged-but-unflushed: discard the stage, nothing on the device.
         if let Some(virt_id) = self.staged_lookup(dirid, &name) {
-            if let Ok(mut st) = self.staged.lock()
+            if let Ok(mut st) = self.inner.staged.lock()
                 && let Some(s) = st.remove(&virt_id)
             {
                 drop(std::fs::remove_file(&s.tmp));
@@ -705,7 +774,7 @@ impl NFSFileSystem for MtpNfs {
                 let dev = self.dev()?;
                 dev.hdelete(idx, h).await.map_err(nfserr)?;
                 // Drop any stage bound to this id.
-                if let Ok(mut st) = self.staged.lock()
+                if let Ok(mut st) = self.inner.staged.lock()
                     && let Some(s) = st.remove(&fid)
                 {
                     drop(std::fs::remove_file(&s.tmp));
@@ -723,7 +792,7 @@ impl NFSFileSystem for MtpNfs {
         to_dirid: nfs3::fileid3,
         to_filename: &nfs3::filename3,
     ) -> Result<(), nfs3::nfsstat3> {
-        if !self.writable {
+        if !self.inner.writable {
             return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
         }
         let from_name = String::from_utf8_lossy(from_filename).to_string();
@@ -731,7 +800,11 @@ impl NFSFileSystem for MtpNfs {
 
         // Staged-unflushed file: pure metadata update.
         if let Some(virt_id) = self.staged_lookup(from_dirid, &from_name) {
-            let mut st = self.staged.lock().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            let mut st = self
+                .inner
+                .staged
+                .lock()
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
             if let Some(s) = st.get_mut(&virt_id) {
                 s.parent_id = to_dirid;
                 s.name = to_name;
@@ -754,7 +827,7 @@ impl NFSFileSystem for MtpNfs {
             .map_err(nfserr)?;
 
         // Keep stage metadata in sync for flushed files.
-        if let Ok(mut st) = self.staged.lock()
+        if let Ok(mut st) = self.inner.staged.lock()
             && let Some(s) = st.get_mut(&fid)
         {
             s.parent_id = to_dirid;
@@ -773,7 +846,7 @@ impl NFSFileSystem for MtpNfs {
         let mut children: Vec<(u64, String, bool, u64)> = Vec::new();
         match decode(dirid) {
             Some(Kind::DeviceRoot) => {
-                for (i, s) in self.storages.read().await.iter().enumerate() {
+                for (i, s) in self.inner.storages.read().await.iter().enumerate() {
                     children.push((
                         STORAGE_BASE_ID + i as u64,
                         s.description.clone(),
@@ -802,7 +875,7 @@ impl NFSFileSystem for MtpNfs {
             None => return Err(nfs3::nfsstat3::NFS3ERR_BADHANDLE),
         }
         // Unflushed staged files are invisible to device listings — add them.
-        if let Ok(st) = self.staged.lock() {
+        if let Ok(st) = self.inner.staged.lock() {
             for (vid, s) in st.iter() {
                 if s.parent_id != dirid || s.flushed_dev.is_some() {
                     continue;
@@ -871,7 +944,7 @@ impl NFSFileSystem for MtpNfs {
         _offset: u64,
         _count: u32,
     ) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
-        if !self.writable {
+        if !self.inner.writable {
             return self.getattr(file_id).await;
         }
         self.flush_stage(file_id).await?;
@@ -937,3 +1010,148 @@ mod tests {
         ));
     }
 }
+
+/// Cheap clonable wrapper so fernfs listeners can own a handle while watchers
+/// keep their own copy (`Arc<MtpNfs>` cannot implement a foreign trait due to
+/// the orphan rule, hence the newtype).
+#[derive(Clone)]
+pub struct SharedMtpNfs(pub std::sync::Arc<MtpNfs>);
+
+macro_rules! delegate_nfs {
+    ($t:ty) => {
+        #[async_trait::async_trait]
+        impl NFSFileSystem for $t {
+            fn generation(&self) -> u64 {
+                self.0.generation()
+            }
+            fn capabilities(&self) -> Capabilities {
+                self.0.capabilities()
+            }
+            fn root_dir(&self) -> nfs3::fileid3 {
+                self.0.root_dir()
+            }
+            async fn lookup(
+                &self,
+                dirid: nfs3::fileid3,
+                filename: &nfs3::filename3,
+            ) -> Result<nfs3::fileid3, nfs3::nfsstat3> {
+                self.0.lookup(dirid, filename).await
+            }
+            async fn getattr(&self, id: nfs3::fileid3) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
+                self.0.getattr(id).await
+            }
+            async fn setattr(
+                &self,
+                id: nfs3::fileid3,
+                s: nfs3::sattr3,
+            ) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
+                self.0.setattr(id, s).await
+            }
+            async fn read(
+                &self,
+                id: nfs3::fileid3,
+                offset: u64,
+                count: u32,
+            ) -> Result<(Vec<u8>, bool), nfs3::nfsstat3> {
+                self.0.read(id, offset, count).await
+            }
+            async fn write(
+                &self,
+                id: nfs3::fileid3,
+                offset: u64,
+                data: &[u8],
+                stable: fernfs::protocol::xdr::nfs3::file::stable_how,
+            ) -> Result<(nfs3::fattr3, nfs3::file::stable_how, nfs3::count3), nfs3::nfsstat3> {
+                self.0.write(id, offset, data, stable).await
+            }
+            async fn create(
+                &self,
+                dirid: nfs3::fileid3,
+                filename: &nfs3::filename3,
+                attr: nfs3::sattr3,
+            ) -> Result<(nfs3::fileid3, nfs3::fattr3), nfs3::nfsstat3> {
+                self.0.create(dirid, filename, attr).await
+            }
+            async fn create_exclusive(
+                &self,
+                dirid: nfs3::fileid3,
+                filename: &nfs3::filename3,
+                verifier: nfs3::createverf3,
+            ) -> Result<nfs3::fileid3, nfs3::nfsstat3> {
+                self.0.create_exclusive(dirid, filename, verifier).await
+            }
+            async fn mkdir(
+                &self,
+                dirid: nfs3::fileid3,
+                dirname: &nfs3::filename3,
+            ) -> Result<(nfs3::fileid3, nfs3::fattr3), nfs3::nfsstat3> {
+                self.0.mkdir(dirid, dirname).await
+            }
+            async fn remove(
+                &self,
+                dirid: nfs3::fileid3,
+                filename: &nfs3::filename3,
+            ) -> Result<(), nfs3::nfsstat3> {
+                self.0.remove(dirid, filename).await
+            }
+            async fn rename(
+                &self,
+                from_dirid: nfs3::fileid3,
+                from_filename: &nfs3::filename3,
+                to_dirid: nfs3::fileid3,
+                to_filename: &nfs3::filename3,
+            ) -> Result<(), nfs3::nfsstat3> {
+                self.0
+                    .rename(from_dirid, from_filename, to_dirid, to_filename)
+                    .await
+            }
+            async fn readdir(
+                &self,
+                dirid: nfs3::fileid3,
+                start_after: nfs3::fileid3,
+                max_entries: usize,
+            ) -> Result<ReadDirResult, nfs3::nfsstat3> {
+                self.0.readdir(dirid, start_after, max_entries).await
+            }
+            async fn symlink(
+                &self,
+                dirid: nfs3::fileid3,
+                linkname: &nfs3::filename3,
+                target: &nfs3::nfspath3,
+                attr: &nfs3::sattr3,
+            ) -> Result<(nfs3::fileid3, nfs3::fattr3), nfs3::nfsstat3> {
+                self.0.symlink(dirid, linkname, target, attr).await
+            }
+            async fn readlink(&self, id: nfs3::fileid3) -> Result<nfs3::nfspath3, nfs3::nfsstat3> {
+                self.0.readlink(id).await
+            }
+            async fn link(
+                &self,
+                file_id: nfs3::fileid3,
+                dir_id: nfs3::fileid3,
+                name: &nfs3::filename3,
+            ) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
+                self.0.link(file_id, dir_id, name).await
+            }
+            async fn mknod(
+                &self,
+                dir_id: nfs3::fileid3,
+                name: &nfs3::filename3,
+                ftype: nfs3::ftype3,
+                specdata: nfs3::specdata3,
+                attrs: &nfs3::sattr3,
+            ) -> Result<(nfs3::fileid3, nfs3::fattr3), nfs3::nfsstat3> {
+                self.0.mknod(dir_id, name, ftype, specdata, attrs).await
+            }
+            async fn commit(
+                &self,
+                file_id: nfs3::fileid3,
+                offset: u64,
+                count: u32,
+            ) -> Result<nfs3::fattr3, nfs3::nfsstat3> {
+                self.0.commit(file_id, offset, count).await
+            }
+        }
+    };
+}
+delegate_nfs!(SharedMtpNfs);
