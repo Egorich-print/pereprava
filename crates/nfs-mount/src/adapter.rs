@@ -45,7 +45,10 @@ struct Stage {
 
 /// NFS view of one connected MTP device.
 pub struct MtpNfs {
-    dev: DeviceHandle,
+    /// Rotating session: `None` while the phone is absent. The listener and
+    /// file-id space live across rotations (generation stays stable), so the
+    /// kernel keeps its filehandles.
+    sess: std::sync::RwLock<Option<DeviceHandle>>,
     storages: tokio::sync::RwLock<Vec<StorageSummary>>,
     epoch: u32,
     writable: bool,
@@ -117,7 +120,7 @@ impl MtpNfs {
         let tmp_dir = std::env::temp_dir().join(format!("pereprava-nfs-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).map_err(pereprava_core::Error::Io)?;
         Ok(Self {
-            dev,
+            sess: std::sync::RwLock::new(Some(dev)),
             storages: tokio::sync::RwLock::new(storages),
             epoch: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -203,8 +206,8 @@ impl MtpNfs {
         const CHUNK: u32 = 1024 * 1024;
         while off < size {
             let want = CHUNK.min((size - off) as u32);
-            let data = self
-                .dev
+            let dev = self.dev()?;
+            let data = dev
                 .hread_range(d.storage_index, d.handle, off, want)
                 .await
                 .map_err(nfserr)?;
@@ -319,11 +322,8 @@ impl MtpNfs {
         }
         match decode(id) {
             Some(Kind::Real(d)) => {
-                let info = self
-                    .dev
-                    .hinfo(d.storage_index, d.handle)
-                    .await
-                    .map_err(nfserr)?;
+                let dev = self.dev()?;
+                let info = dev.hinfo(d.storage_index, d.handle).await.map_err(nfserr)?;
                 // Parent NFS id from the object's recorded parent handle.
                 let parent_id = if info.parent == 0 {
                     STORAGE_BASE_ID + d.storage_index as u64
@@ -359,14 +359,15 @@ impl MtpNfs {
         // Parent must be resolvable to a real handle.
         let (_p_idx, p_handle) = self.parent_handle_of(parent_id)?;
 
+        let dev = self.dev()?;
         if let Some(old) = origin_dev {
-            let _ = self.dev.hdelete(idx, ObjectHandle(old)).await; // NotFound is fine
+            let _ = dev.hdelete(idx, ObjectHandle(old)).await; // NotFound is fine
         }
         let file = tokio::fs::File::open(&tmp)
             .await
             .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
-        let new_entry = self
-            .dev
+        let dev = self.dev()?;
+        let new_entry = dev
             .hupload(
                 idx,
                 p_handle,
@@ -385,6 +386,33 @@ impl MtpNfs {
             s.size = size;
         }
         Ok(())
+    }
+
+    /// Snapshot of the current session handle (sync clone; no await held).
+    fn dev(&self) -> Result<DeviceHandle, nfs3::nfsstat3> {
+        match self.sess.read() {
+            Ok(g) => g.clone().ok_or(nfs3::nfsstat3::NFS3ERR_IO),
+            Err(_) => Err(nfs3::nfsstat3::NFS3ERR_IO),
+        }
+    }
+
+    /// Installs a fresh session (device just connected).
+    pub async fn attach(&self, dev: DeviceHandle) -> Result<(), pereprava_core::Error> {
+        let storages = dev.storages().await?;
+        *self.storages.write().await = storages;
+        *self
+            .sess
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dev);
+        Ok(())
+    }
+
+    /// Drops the session (device gone). Staged files are kept on disk.
+    pub fn detach(&self) {
+        *self
+            .sess
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     fn attr_for(&self, id: u64, is_dir: bool, size: u64) -> nfs3::fattr3 {
@@ -453,11 +481,8 @@ impl NFSFileSystem for MtpNfs {
                 Err(nfs3::nfsstat3::NFS3ERR_NOENT)
             }
             Some(Kind::StorageRoot(idx)) => {
-                let entries = self
-                    .dev
-                    .hlist(idx, ObjectHandle::ROOT)
-                    .await
-                    .map_err(nfserr)?;
+                let dev = self.dev()?;
+                let entries = dev.hlist(idx, ObjectHandle::ROOT).await.map_err(nfserr)?;
                 for e in entries {
                     if names_eq_ci(&e.name, &name) {
                         return Ok(encode_real(idx, e.handle));
@@ -466,11 +491,8 @@ impl NFSFileSystem for MtpNfs {
                 Err(nfs3::nfsstat3::NFS3ERR_NOENT)
             }
             Some(Kind::Real(d)) => {
-                let entries = self
-                    .dev
-                    .hlist(d.storage_index, d.handle)
-                    .await
-                    .map_err(nfserr)?;
+                let dev = self.dev()?;
+                let entries = dev.hlist(d.storage_index, d.handle).await.map_err(nfserr)?;
                 for e in entries {
                     if names_eq_ci(&e.name, &name) {
                         return Ok(encode_real(d.storage_index, e.handle));
@@ -498,12 +520,9 @@ impl NFSFileSystem for MtpNfs {
                 }
             }
             Some(Kind::Real(d)) => {
-                let e = self
-                    .dev
-                    .hinfo(d.storage_index, d.handle)
-                    .await
-                    .map_err(nfserr)?;
-                Ok(self.attr_for(id, e.is_dir, e.size))
+                let dev = self.dev()?;
+                let info = dev.hinfo(d.storage_index, d.handle).await.map_err(nfserr)?;
+                Ok(self.attr_for(id, info.is_dir, info.size))
             }
             None => Err(nfs3::nfsstat3::NFS3ERR_BADHANDLE),
         }
@@ -565,11 +584,8 @@ impl NFSFileSystem for MtpNfs {
         }
         match decode(id) {
             Some(Kind::Real(d)) => {
-                let info = self
-                    .dev
-                    .hinfo(d.storage_index, d.handle)
-                    .await
-                    .map_err(nfserr)?;
+                let dev = self.dev()?;
+                let info = dev.hinfo(d.storage_index, d.handle).await.map_err(nfserr)?;
                 // Kernel clients may speculatively read past EOF; Android
                 // answers GetPartialObject out-of-range with an error, so
                 // clamp to the object bounds ourselves.
@@ -577,8 +593,8 @@ impl NFSFileSystem for MtpNfs {
                     return Ok((Vec::new(), true));
                 }
                 let clamped = (count as u64).min(info.size - offset) as u32;
-                let data = self
-                    .dev
+                let dev = self.dev()?;
+                let data = dev
                     .hread_range(d.storage_index, d.handle, offset, clamped)
                     .await
                     .map_err(nfserr)?;
@@ -656,7 +672,8 @@ impl NFSFileSystem for MtpNfs {
         }
         let name = String::from_utf8_lossy(dirname).to_string();
         let (idx, parent) = self.parent_handle_of(dirid)?;
-        let e = self.dev.hmkdir(idx, parent, &name).await.map_err(nfserr)?;
+        let dev = self.dev()?;
+        let e = dev.hmkdir(idx, parent, &name).await.map_err(nfserr)?;
         let id = encode_real(idx, e.handle);
         Ok((id, self.attr_for(id, true, 0)))
     }
@@ -685,7 +702,8 @@ impl NFSFileSystem for MtpNfs {
         let fid = self.lookup(dirid, filename).await?;
         match self.device_handle_of(fid) {
             Some((idx, h)) => {
-                self.dev.hdelete(idx, h).await.map_err(nfserr)?;
+                let dev = self.dev()?;
+                dev.hdelete(idx, h).await.map_err(nfserr)?;
                 // Drop any stage bound to this id.
                 if let Ok(mut st) = self.staged.lock()
                     && let Some(s) = st.remove(&fid)
@@ -730,8 +748,8 @@ impl NFSFileSystem for MtpNfs {
         if fp_idx != tp_idx {
             return Err(nfs3::nfsstat3::NFS3ERR_INVAL); // cross-storage not supported
         }
-        self.dev
-            .hrename(idx, fp_handle, &from_name, tp_handle, &to_name)
+        let dev = self.dev()?;
+        dev.hrename(idx, fp_handle, &from_name, tp_handle, &to_name)
             .await
             .map_err(nfserr)?;
 
@@ -765,22 +783,14 @@ impl NFSFileSystem for MtpNfs {
                 }
             }
             Some(Kind::StorageRoot(idx)) => {
-                for e in self
-                    .dev
-                    .hlist(idx, ObjectHandle::ROOT)
-                    .await
-                    .map_err(nfserr)?
-                {
+                let dev = self.dev()?;
+                for e in dev.hlist(idx, ObjectHandle::ROOT).await.map_err(nfserr)? {
                     children.push((encode_real(idx, e.handle), e.name.clone(), e.is_dir, e.size));
                 }
             }
             Some(Kind::Real(d)) => {
-                for e in self
-                    .dev
-                    .hlist(d.storage_index, d.handle)
-                    .await
-                    .map_err(nfserr)?
-                {
+                let dev = self.dev()?;
+                for e in dev.hlist(d.storage_index, d.handle).await.map_err(nfserr)? {
                     children.push((
                         encode_real(d.storage_index, e.handle),
                         e.name.clone(),
