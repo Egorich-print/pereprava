@@ -37,8 +37,10 @@ say "prepare remote dir"
 target/debug/pereprava mkdir "$DIR" >/dev/null 2>&1 || true
 
 say "start serve-only NFS (writable)"
+# NOTE: do NOT pass --export here — libnfs resolves the FULL url path
+# against the device root; a custom export shifts levels and breaks MNT.
 nohup target/debug/pereprava mount --serve-only --port $PORT \
-      --allow-unprivileged-source-port --export "/1" \
+      --allow-unprivileged-source-port \
       >/tmp/pv-e2e-server.log 2>&1 &
 sleep 5
 
