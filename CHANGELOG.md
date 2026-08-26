@@ -6,6 +6,19 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v0.5)
+
+- Menu-bar bridge icon 🌉 (`pereprava-menubar`, pure Rust + objc2):
+  connection state, model, live transfer rates, open-volume / unmount /
+  quit actions. Reads a status JSON published by the watch daemon every
+  poll cycle.
+- Watch daemon publishes `/tmp/pereprava-status.json` (atomic rename)
+  including per-cycle speed computed from adapter traffic counters.
+- Traffic counters live in the NFS adapter (rx = device→Mac,
+  tx = Mac→device), incremented on ranged reads and stage flushes.
+- Installer now also registers a user LaunchAgent for the menu bar.
+
+
 ### Added (v0.4)
 
 - Writable Finder volume: write-back staging per ADR-004 — POSIX writes land
