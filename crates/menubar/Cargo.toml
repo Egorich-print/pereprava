@@ -1,0 +1,34 @@
+[package]
+name = "pereprava-menubar"
+description = "macOS menu bar bridge icon showing pereprava status"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pereprava-menubar"
+path = "src/main.rs"
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSThread", "NSTimer", "NSValue"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSStatusBar", "NSStatusItem", "NSButton",
+    "NSMenu", "NSMenuItem", "NSRunningApplication", "NSEvent",
+    "NSWorkspace", "NSResponder",
+] }
+block2 = "0.6"
+
+# FFI to AppKit requires unsafe; the workspace forbid is intentionally not
+# inherited here. Business logic lives in pereprava-core/nfs-mount.
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+dbg_macro = "deny"

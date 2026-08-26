@@ -113,6 +113,11 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
 
     let poll = std::time::Duration::from_secs(poll_secs);
     let mut mounted = false;
+    let mut used_path = String::new();
+    let mut last_model = String::new();
+    let mut prev_counters = (0u64, 0u64);
+    let mut prev_instant = std::time::Instant::now();
+    write_status_file("waiting", "", "", 0, 0, 0, 0);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -140,11 +145,13 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
                         drop(dev.close().await);
                         continue;
                     }
+                    last_model = model.clone();
                     println!("phone attached ({model})");
                     if !mounted {
                         match pereprava_nfs::mount(port, &path).await {
                             Ok(used) => {
                                 mounted = true;
+                                used_path = used.display().to_string();
                                 println!(
                                     "volume mounted at {} — reconnects are prompt-free",
                                     used.display()
@@ -166,11 +173,7 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
         } else {
             // Liveness = does the SESSION still answer? Bus enumeration lies
             // (charge-only mode, unrelated USB gadgets), the session doesn't.
-            let alive = {
-                let dev_ok = nfs.test_session().await;
-                dev_ok
-            };
-            if !alive {
+            if !nfs.test_session().await {
                 println!("phone gone: session paused (volume stays mounted)");
                 nfs.detach();
             }
@@ -180,4 +183,32 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
     println!("watch stopped: detaching session (volume left as-is)");
     server.abort();
     Ok(())
+}
+
+/// Writes the menu-bar status file atomically.
+fn write_status_file(
+    state: &str,
+    model: &str,
+    mounted: &str,
+    rx: u64,
+    tx: u64,
+    speed_rx: u64,
+    speed_tx: u64,
+) {
+    let esc = |s: &str| s.replace('"', "\\\"");
+    let body = format!(
+        "{{\"state\":\"{}\",\"model\":\"{}\",\"mounted\":\"{}\",\"rx\":{},\"tx\":{},\"speed_rx\":{},\"speed_tx\":{}}}",
+        esc(state),
+        esc(model),
+        esc(mounted),
+        rx,
+        tx,
+        speed_rx,
+        speed_tx
+    );
+    let dst = std::path::PathBuf::from("/tmp/pereprava-status.json");
+    let tmp = dst.with_extension("json.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        drop(std::fs::rename(&tmp, &dst));
+    }
 }

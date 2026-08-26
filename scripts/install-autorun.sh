@@ -52,5 +52,28 @@ sudo launchctl bootstrap system "$PLIST" 2>/dev/null || \
   sudo launchctl load -w "$PLIST"
 rm -f "$TMP"
 
-echo "done. Logs: $LOG"
+echo "== installing menu-bar icon (user agent, no sudo) =="
+MB_BIN="$PWD/target/release/pereprava-menubar"
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+mkdir -p "$AGENTS_DIR"
+MB_PLIST="$AGENTS_DIR/com.egorich.pereprava.menubar.plist"
+cat > "$MB_PLIST" <<XML2
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.egorich.pereprava.menubar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$MB_BIN</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+</dict>
+</plist>
+XML2
+launchctl bootout gui/$UID/com.egorich.pereprava.menubar 2>/dev/null || true
+launchctl bootstrap gui/$UID "$MB_PLIST" && echo "меню-бар запущен 🌉"
+
+echo "done. Daemon log: $LOG"
 echo "Phone will auto-appear in Finder on every connection."

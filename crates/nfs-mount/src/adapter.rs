@@ -44,9 +44,19 @@ struct Stage {
 }
 
 /// NFS view of one connected MTP device.
+/// Live transfer counters (bytes pulled from / pushed to the phone).
+#[derive(Default)]
+pub struct Stats {
+    /// Bytes read from the device (phone -> Mac).
+    pub rx: std::sync::atomic::AtomicU64,
+    /// Bytes written to the device (Mac -> phone).
+    pub tx: std::sync::atomic::AtomicU64,
+}
+
 /// Shared inner state; `MtpNfs` is a cheap handle (Clone) so watchers can
 /// keep copies while fernfs owns another one.
 struct Inner {
+    stats: std::sync::Arc<Stats>,
     /// Rotating session: `None` while the phone is absent. The listener and
     /// file-id space live across rotations (generation stays stable), so the
     /// kernel keeps its filehandles.
@@ -129,6 +139,7 @@ impl MtpNfs {
         std::fs::create_dir_all(&tmp_dir).map_err(pereprava_core::Error::Io)?;
         Ok(Self {
             inner: std::sync::Arc::new(Inner {
+                stats: std::sync::Arc::new(Stats::default()),
                 sess: std::sync::RwLock::new(None),
                 storages: tokio::sync::RwLock::new(Vec::new()),
                 epoch: std::time::SystemTime::now()
@@ -141,6 +152,16 @@ impl MtpNfs {
                 tmp_dir,
             }),
         })
+    }
+
+    /// Live traffic counters snapshot `(rx_bytes, tx_bytes)`.
+    #[must_use]
+    pub fn stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.inner.stats.rx.load(Relaxed),
+            self.inner.stats.tx.load(Relaxed),
+        )
     }
 
     /// Classic constructor: detached + immediate attach.
@@ -239,6 +260,10 @@ impl MtpNfs {
             if data.is_empty() {
                 break;
             }
+            self.inner
+                .stats
+                .rx
+                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             out.seek(std::io::SeekFrom::Start(off))
                 .and_then(|_| out.write_all(&data))
                 .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
@@ -370,7 +395,7 @@ impl MtpNfs {
         }
     }
 
-    /// Flushes a dirty staged file to the device    /// Flushes a dirty staged file to the device: delete old object, upload
+    /// Flushes a dirty staged file to the device: delete old object, upload
     /// the local copy, remember the new handle.
     async fn flush_stage(&self, id: u64) -> Result<(), nfs3::nfsstat3> {
         let snapshot = {
@@ -416,6 +441,10 @@ impl MtpNfs {
             .await
             .map_err(nfserr)?;
 
+        self.inner
+            .stats
+            .tx
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
         let mut st = self
             .inner
             .staged
@@ -469,7 +498,7 @@ impl MtpNfs {
         let Some(dev) = self.inner.sess.read().ok().and_then(|g| g.clone()) else {
             return false;
         };
-        matches!(dev.info().await, Ok(_))
+        dev.info().await.is_ok()
     }
 
     fn attr_for(&self, id: u64, is_dir: bool, size: u64) -> nfs3::fattr3 {
@@ -664,6 +693,10 @@ impl NFSFileSystem for MtpNfs {
                     .await
                     .map_err(nfserr)?;
                 let eof = offset + data.len() as u64 >= info.size;
+                self.inner
+                    .stats
+                    .rx
+                    .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 Ok((data, eof))
             }
             _ => Err(nfs3::nfsstat3::NFS3ERR_ISDIR),
