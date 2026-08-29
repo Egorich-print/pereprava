@@ -14,7 +14,7 @@ mod json;
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, Sel};
-use objc2::{ClassType, class, define_class, msg_send, sel};
+use objc2::{define_class, msg_send, sel, ClassType};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSRunningApplication,
     NSStatusBar, NSStatusItem,

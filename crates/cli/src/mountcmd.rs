@@ -113,10 +113,10 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
 
     let poll = std::time::Duration::from_secs(poll_secs);
     let mut mounted = false;
-    let mut used_path = String::new();
-    let mut last_model = String::new();
-    let mut prev_counters = (0u64, 0u64);
-    let mut prev_instant = std::time::Instant::now();
+let mut used_path = String::new();
+let mut last_model = String::new();
+    let prev_counters = (0u64, 0u64);
+    let prev_instant = std::time::Instant::now();
     write_status_file("waiting", "", "", 0, 0, 0, 0);
     loop {
         tokio::select! {
