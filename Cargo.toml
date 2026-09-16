@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "crates/nfs-mount", "crates/menubar"]
+members = ["crates/core", "crates/cli", "crates/nfs-mount"]
+# The Tauri widget is a standalone crate with its own lockfile: `tauri build`
+# needs the Svelte `ui/dist` to exist and must not be pulled into a plain
+# `cargo build --workspace`.
+exclude = ["crates/widget"]
 
 [workspace.package]
 version = "0.1.0"

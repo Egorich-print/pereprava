@@ -1,0 +1,36 @@
+# Standalone crate (own workspace): the Tauri build expects `ui/dist` to exist
+# and therefore must not be pulled into `cargo build --workspace`.
+[workspace]
+
+[package]
+name = "pereprava-widget"
+description = "Tauri v2 + Svelte status widget for pereprava (tray icon + dashboard)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Egorich-print"]
+repository = "https://github.com/Egorich-print/pereprava"
+homepage = "https://github.com/Egorich-print/pereprava"
+
+[[bin]]
+name = "pereprava-widget"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# FFI/AppKit-style platform glue lives here; the shared lints do not apply.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+dbg_macro = "deny"

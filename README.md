@@ -38,9 +38,11 @@ cd pereprava
 cargo install --path crates/cli
 ```
 
-Rust 1.98+ (edition 2024) required. No other dependencies on macOS.
+Rust 1.98+ (edition 2024) required; no other dependencies on macOS for the
+CLI. The status widget additionally needs Node and `cargo-tauri`
+(`cargo install tauri-cli --version "^2"`).
 
-## Usage (v0.2)
+## Usage
 
 ```shell
 pereprava doctor                 # diagnose device access (ptpcamerad, AFT conflicts)
@@ -59,9 +61,34 @@ pereprava unpack <remote.tar.zst> <dest-dir>   # extract locally
 pereprava mount                  # phone appears in Finder (WRITABLE!)
 pereprava mount --read-only      # read-only variant
 pereprava bench [--bundle]       # throughput micro-benchmarks
+
+pereprava watch                  # keep the Finder volume alive across reconnects
+pereprava unmount                # detach the volume
 ```
 
 Numbers and methodology: [docs/benchmarks/baseline.md](docs/benchmarks/baseline.md).
+
+## Plug & play + status widget
+
+```shell
+scripts/install-autorun.sh       # daemon + widget (one sudo prompt)
+```
+
+The installer registers a root LaunchDaemon that runs `pereprava watch` — the
+phone auto-appears in Finder every time it is plugged in, no prompts after the
+first mount — and installs **Pereprava.app**, a menu-bar widget built with
+**Tauri v2 + Svelte** (see
+[ADR-005](docs/adr/ADR-005-status-widget-tauri.md)). It shows connection state,
+live transfer rates, cumulative totals and the mount point, with open/unmount
+actions. The daemon publishes `/tmp/pereprava-status.json` for it.
+
+```
+crates/
+├── core/        protocol actor, caching, path/name handling
+├── cli/         pereprava binary (mount, watch, pack, ...)
+├── nfs-mount/   NFSv3 loopback adapter + mount automation
+└── widget/      Tauri v2 + Svelte status widget (standalone workspace)
+```
 
 ## macOS note: ptpcamerad
 
