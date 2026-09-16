@@ -12,9 +12,13 @@ use crate::model::Entry;
 /// How long a directory listing stays fresh.
 pub const LIST_TTL: Duration = Duration::from_secs(10);
 
+/// Upper bound on live listings kept per storage. Expired entries are pruned
+/// on every store; this cap protects a long-lived process from unbounded
+/// growth when many distinct directories are walked.
+const MAX_LISTINGS: usize = 256;
+
 #[derive(Debug, Default)]
 struct StorageCache {
-    entries: HashMap<u64, Entry>,
     listings: HashMap<u64, Listing>,
 }
 
@@ -52,11 +56,20 @@ impl MetaCache {
         Some(&l.children)
     }
 
-    /// Stores a fresh listing for `dir` and indexes every child entry.
+    /// Stores a fresh listing for `dir`, pruning stale entries first.
     pub fn store_listing(&mut self, storage_id: u32, dir: u64, children: Vec<Entry>) {
         let st = self.slot(storage_id);
-        for e in &children {
-            st.entries.insert(e.handle, e.clone());
+        st.listings
+            .retain(|_, l| l.fetched_at.elapsed() <= LIST_TTL);
+        if st.listings.len() >= MAX_LISTINGS
+            && !st.listings.contains_key(&dir)
+            && let Some(oldest) = st
+                .listings
+                .iter()
+                .min_by_key(|(_, l)| l.fetched_at)
+                .map(|(k, _)| *k)
+        {
+            st.listings.remove(&oldest);
         }
         st.listings.insert(
             dir,
@@ -67,14 +80,9 @@ impl MetaCache {
         );
     }
 
-    /// Drops the cached listing of `parent` (after create/delete/rename/move)
-    /// and removes `handle` from the entry index when given.
-    pub fn invalidate(&mut self, storage_id: u32, parent: u64, handle: Option<u64>) {
-        let st = self.slot(storage_id);
-        st.listings.remove(&parent);
-        if let Some(h) = handle {
-            st.entries.remove(&h);
-        }
+    /// Drops the cached listing of `parent` (after create/delete/rename/move).
+    pub fn invalidate(&mut self, storage_id: u32, parent: u64) {
+        self.slot(storage_id).listings.remove(&parent);
     }
 
     /// Drops every cached fact about a storage.
@@ -108,10 +116,10 @@ mod tests {
     }
 
     #[test]
-    fn invalidation_drops_parent_and_entry() {
+    fn invalidation_drops_parent_listing() {
         let mut c = MetaCache::new();
         c.store_listing(7, 0, vec![entry(1, "a.txt")]);
-        c.invalidate(7, 0, Some(1));
+        c.invalidate(7, 0);
         assert!(c.listing(7, 0).is_none());
     }
 

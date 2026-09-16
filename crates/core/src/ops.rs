@@ -10,6 +10,12 @@ use crate::actor::DeviceHandle;
 use crate::error::Result;
 use crate::model::Progress;
 
+/// True when `name` is a single, ordinary path component that is safe to join
+/// onto a local directory.
+fn is_safe_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
 /// Counters produced by a recursive transfer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TreeStats {
@@ -48,7 +54,11 @@ async fn pull_tree_inner(
     };
 
     for e in entries {
-        if e.name == "." || e.name == ".." {
+        // Device-reported names are untrusted: reject anything that is not a
+        // single normal path component so a hostile/buggy device cannot make
+        // us write outside `local_root`.
+        if !is_safe_component(&e.name) {
+            tracing::warn!("skipping unsafe device entry name {:?}", e.name);
             continue;
         }
         let child_local = local_root.join(&e.name);

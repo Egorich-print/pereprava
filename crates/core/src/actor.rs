@@ -26,6 +26,9 @@ use crate::path::DevPath;
 /// Upload read chunk (kept modest so bounded channels stay meaningful).
 const UPLOAD_CHUNK: usize = 256 * 1024;
 
+/// Upper bound on the initial storage probe of a USB candidate.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A storage volume as known to the actor.
 #[derive(Debug, Clone)]
 struct StorageRec {
@@ -159,6 +162,7 @@ enum Request {
 pub struct DeviceHandle {
     tx: mpsc::Sender<Request>,
     finished: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>>,
+    abort: tokio::task::AbortHandle,
 }
 
 /// USB-level probe result used by `doctor` before any session is opened.
@@ -248,17 +252,22 @@ impl DeviceHandle {
 
         let mut last_err: Option<Error> = None;
         for cand in &candidates {
+            let (vid, pid) = (cand.vendor_id, cand.product_id);
             match MtpDevice::builder()
                 .open_by_location(cand.location_id)
                 .await
             {
-                Ok(device) => return Self::spawn_actor(device).await,
+                Ok(device) => match Self::spawn_actor(device).await {
+                    Ok(handle) => return Ok(handle),
+                    Err(e) => {
+                        // Opens but is not a usable MTP target (no storages,
+                        // wedged probe, ...): keep looking at other candidates.
+                        tracing::debug!("candidate {vid:04x}:{pid:04x} unusable: {e}");
+                        last_err = Some(e);
+                    }
+                },
                 Err(e) => {
-                    tracing::debug!(
-                        "candidate {:04x}:{:04x} rejected: {e}",
-                        cand.vendor_id,
-                        cand.product_id
-                    );
+                    tracing::debug!("candidate {vid:04x}:{pid:04x} rejected: {e}");
                     last_err = Some(Error::mtp_msg(&e));
                 }
             }
@@ -267,11 +276,38 @@ impl DeviceHandle {
     }
 
     async fn spawn_actor(device: MtpDevice) -> Result<Self> {
+        let (device, storages) = Self::read_storages(device).await?;
+        if storages.is_empty() {
+            // A device that opens but exposes no storage is not a usable MTP
+            // target: USB-UART adapters, PTP cameras and half-initialised
+            // sessions all land here. Release it and let the caller move on.
+            let _ = device.close().await;
+            return Err(Error::Mtp("device exposes no storages".into()));
+        }
+
         let (tx, rx) = mpsc::channel::<Request>(16);
         let (done_tx, done_rx) = oneshot::channel::<()>();
+        let state = ActorState {
+            device,
+            storages,
+            cache: MetaCache::new(),
+        };
+        let task = tokio::spawn(async move {
+            state.run(rx).await;
+            // Signal completion so `DeviceHandle::close` can await a clean
+            // session teardown even across process lifetimes.
+            let _ = done_tx.send(());
+        });
+        Ok(Self {
+            tx,
+            finished: Arc::new(tokio::sync::Mutex::new(Some(done_rx))),
+            abort: task.abort_handle(),
+        })
+    }
 
-        // Storages must be read on the task that owns the session; hand the
-        // device over to it and wait for the storage table here.
+    /// Reads the storage table on a task that owns the session, with a bound
+    /// so a non-answering device cannot stall the candidate scan.
+    async fn read_storages(device: MtpDevice) -> Result<(MtpDevice, Vec<StorageRec>)> {
         let (st_tx, st_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut storages = Vec::new();
@@ -289,27 +325,11 @@ impl DeviceHandle {
             }
             let _ = st_tx.send((device, storages));
         });
-        let (device, read_storages) = match st_rx.await {
-            Ok(v) => v,
-            Err(_) => return Err(Error::ActorClosed),
-        };
-        let storages = read_storages;
-
-        let state = ActorState {
-            device,
-            storages,
-            cache: MetaCache::new(),
-        };
-        tokio::spawn(async move {
-            state.run(rx).await;
-            // Signal completion so `DeviceHandle::close` can await a clean
-            // session teardown even across process lifetimes.
-            let _ = done_tx.send(());
-        });
-        Ok(Self {
-            tx,
-            finished: Arc::new(tokio::sync::Mutex::new(Some(done_rx))),
-        })
+        let (device, storages) = tokio::time::timeout(PROBE_TIMEOUT, st_rx)
+            .await
+            .map_err(|_| Error::Mtp("device did not answer the storage probe".into()))?
+            .map_err(|_| Error::ActorClosed)?;
+        Ok((device, storages))
     }
 
     /// Gracefully stops the actor and closes the MTP session.
@@ -330,6 +350,16 @@ impl DeviceHandle {
             let _ = rx.await;
         }
         Ok(())
+    }
+
+    /// Tears the actor task down without waiting for it.
+    ///
+    /// [`close`] is the polite path, but it queues a shutdown request behind
+    /// whatever the actor is doing. When the device has stopped answering, an
+    /// in-flight transfer would never complete and `close` would hang forever.
+    /// Aborting drops the session (and its USB claim) immediately.
+    pub fn force_close(&self) {
+        self.abort.abort();
     }
 
     async fn call<R>(&self, make: impl FnOnce(oneshot::Sender<Result<R>>) -> Request) -> Result<R> {
@@ -660,7 +690,7 @@ impl ActorState {
                         .storage(storage_index)
                         .map(|s| s.id.0 as u32)
                         .unwrap_or(0);
-                    self.cache.invalidate(sid, 0, None);
+                    self.cache.invalidate(sid, 0);
                 }
                 let _ = reply.send(out);
             }
@@ -710,7 +740,7 @@ impl ActorState {
                         .storage(storage_index)
                         .map(|s| s.id.0 as u32)
                         .unwrap_or(0);
-                    self.cache.invalidate(sid, parent.0, None);
+                    self.cache.invalidate(sid, parent.0);
                 }
                 let _ = reply.send(out);
             }
@@ -1054,7 +1084,7 @@ impl ActorState {
                             .await
                             .map_err(Error::from)?;
                         let sid = self.storage(idx)?.id.0 as u32;
-                        self.cache.invalidate(sid, cur.0, None);
+                        self.cache.invalidate(sid, cur.0);
                         cur = h;
                     }
                     let rec_name = p.segments.last().cloned().unwrap_or_default();
@@ -1107,7 +1137,7 @@ impl ActorState {
         };
 
         let sid = self.storage(idx)?.id.0 as u32;
-        self.cache.invalidate(sid, parent.0, Some(target.handle));
+        self.cache.invalidate(sid, parent.0);
         Ok(n)
     }
 
@@ -1133,7 +1163,7 @@ impl ActorState {
             let storage = self.open_storage(idx).await?;
             storage.delete(dir).await.map_err(Error::from)?;
             let sid = self.storage(idx)?.id.0 as u32;
-            self.cache.invalidate(sid, dir.0, None);
+            self.cache.invalidate(sid, dir.0);
             Ok(count + 1)
         })
     }
@@ -1166,9 +1196,8 @@ impl ActorState {
                 .move_object(ObjectHandle(src.handle), to_parent, Some(sid))
                 .await
                 .map_err(Error::from)?;
-            self.cache
-                .invalidate(sid.0 as u32, from_parent.0, Some(src.handle));
-            self.cache.invalidate(sid.0 as u32, to_parent.0, None);
+            self.cache.invalidate(sid.0 as u32, from_parent.0);
+            self.cache.invalidate(sid.0 as u32, to_parent.0);
         }
 
         let final_handle = ObjectHandle(src.handle);
@@ -1180,7 +1209,7 @@ impl ActorState {
                     .await
                     .map_err(Error::from)?;
                 let sid32 = sid.0 as u32;
-                self.cache.invalidate(sid32, to_parent.0, None);
+                self.cache.invalidate(sid32, to_parent.0);
             }
         }
 
@@ -1224,7 +1253,7 @@ impl ActorState {
             .map_err(Error::from)?;
 
         let sid = self.storage(idx)?.id.0 as u32;
-        self.cache.invalidate(sid, parent.0, Some(target.handle));
+        self.cache.invalidate(sid, parent.0);
 
         let info = storage
             .get_object_info(ObjectHandle(target.handle))
@@ -1274,9 +1303,8 @@ impl ActorState {
             .await
             .map_err(Error::from)?;
 
-        self.cache
-            .invalidate(sid_u32, src_parent.0, Some(target.handle));
-        self.cache.invalidate(sid_u32, dst_dir.handle.0, None);
+        self.cache.invalidate(sid_u32, src_parent.0);
+        self.cache.invalidate(sid_u32, dst_dir.handle.0);
 
         let info = storage
             .get_object_info(ObjectHandle(target.handle))
@@ -1367,7 +1395,15 @@ impl ActorState {
                 },
             ));
 
-        let storage = self.open_storage(idx).await?;
+        let storage = match self.open_storage(idx).await {
+            Ok(s) => s,
+            Err(e) => {
+                // Abort before returning: dropping the handle does not stop
+                // the ticker, which would otherwise run for process lifetime.
+                ticker.abort();
+                return Err(e);
+            }
+        };
         let info = NewObjectInfo::file(name, size);
         let uploaded = match storage
             .upload(
@@ -1394,7 +1430,7 @@ impl ActorState {
         ticker.abort();
 
         let sid = self.storage(idx)?.id.0 as u32;
-        self.cache.invalidate(sid, parent.0, None);
+        self.cache.invalidate(sid, parent.0);
 
         let oi = storage
             .get_object_info(uploaded)
