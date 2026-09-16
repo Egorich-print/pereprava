@@ -90,18 +90,10 @@ pub async fn detach(path: PathBuf) -> Result<()> {
 /// no additional admin prompts appear after the very first mount.
 #[allow(clippy::too_many_arguments)]
 pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) -> Result<()> {
-    use std::sync::Arc;
-
-    use pereprava_core::actor;
-
     let nfs =
         std::sync::Arc::new(MtpNfs::new_detached(!read_only).context("preparing the NFS adapter")?);
-    let shared = pereprava_nfs::SharedMtpNfs(nfs.clone());
 
-    let listener =
-        pereprava_nfs::fernfs::tcp::NFSTcpListener::bind(&format!("127.0.0.1:{port}"), shared)
-            .await
-            .with_context(|| format!("binding NFS server on 127.0.0.1:{port}"))?;
+    let listener = bind_nfs(port, &nfs).await?;
     let server = tokio::spawn(async move {
         use pereprava_nfs::fernfs::tcp::NFSTcp;
         if let Err(e) = listener.handle_forever().await {
@@ -113,16 +105,22 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
 
     let poll = std::time::Duration::from_secs(poll_secs);
     let mut mounted = false;
-let mut used_path = String::new();
-let mut last_model = String::new();
-    let prev_counters = (0u64, 0u64);
-    let prev_instant = std::time::Instant::now();
+    let mut used_path = String::new();
+    let mut last_model = String::new();
+    let mut prev_counters = nfs.stats();
+    let mut prev_instant = std::time::Instant::now();
     write_status_file("waiting", "", "", 0, 0, 0, 0);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = tokio::time::sleep(poll) => {}
         }
+
+        let mut state = if nfs.is_attached() {
+            "attached"
+        } else {
+            "waiting"
+        };
 
         if !nfs.is_attached() {
             // ptpcamerad re-claims freshly plugged MTP devices within
@@ -143,27 +141,29 @@ let mut last_model = String::new();
                     if let Err(e) = nfs.attach(dev.clone()).await {
                         eprintln!("attach failed: {e}");
                         drop(dev.close().await);
-                        continue;
-                    }
-                    last_model = model.clone();
-                    println!("phone attached ({model})");
-                    if !mounted {
-                        match pereprava_nfs::mount(port, &path).await {
-                            Ok(used) => {
-                                mounted = true;
-                                used_path = used.display().to_string();
-                                println!(
-                                    "volume mounted at {} — reconnects are prompt-free",
-                                    used.display()
-                                );
-                            }
-                            Err(e) => {
-                                // Back off hard: osascript prompts stack otherwise.
-                                eprintln!(
-                                    "mount failed ({e});\n  fix: sudo umount -f {path:?} && rerun, \
-                                     or install autorun via scripts/install-autorun.sh"
-                                );
-                                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    } else {
+                        last_model = model;
+                        state = "attached";
+                        println!("phone attached ({last_model})");
+                        if !mounted || !is_mounted(std::path::Path::new(&used_path)) {
+                            match pereprava_nfs::mount(port, &path).await {
+                                Ok(used) => {
+                                    mounted = true;
+                                    used_path = used.display().to_string();
+                                    println!(
+                                        "volume mounted at {} — reconnects are prompt-free",
+                                        used.display()
+                                    );
+                                }
+                                Err(e) => {
+                                    // Back off hard: osascript prompts stack otherwise.
+                                    eprintln!(
+                                        "mount failed ({e});\n  fix: sudo umount -f {path:?} && \
+                                         rerun, or install autorun via \
+                                         scripts/install-autorun.sh"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                }
                             }
                         }
                     }
@@ -176,13 +176,80 @@ let mut last_model = String::new();
             if !nfs.test_session().await {
                 println!("phone gone: session paused (volume stays mounted)");
                 nfs.detach();
+                state = "gone";
             }
         }
+
+        // Publish live counters + throughput for the status widget.
+        let counters = nfs.stats();
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(prev_instant).as_secs_f64().max(0.001);
+        let speed_rx = ((counters.0.saturating_sub(prev_counters.0)) as f64 / elapsed) as u64;
+        let speed_tx = ((counters.1.saturating_sub(prev_counters.1)) as f64 / elapsed) as u64;
+        prev_counters = counters;
+        prev_instant = now;
+        write_status_file(
+            state,
+            &last_model,
+            &used_path,
+            counters.0,
+            counters.1,
+            speed_rx,
+            speed_tx,
+        );
     }
 
     println!("watch stopped: detaching session (volume left as-is)");
     server.abort();
     Ok(())
+}
+
+/// Binds the loopback NFS listener, waiting out a port held by another
+/// instance rather than failing.
+///
+/// The port doubles as a singleton lock: with a `KeepAlive` launchd job a hard
+/// bind failure would otherwise turn into a crash/restart loop that spams the
+/// log and races the live instance.
+async fn bind_nfs(
+    port: u16,
+    nfs: &std::sync::Arc<MtpNfs>,
+) -> Result<pereprava_nfs::fernfs::tcp::NFSTcpListener<pereprava_nfs::SharedMtpNfs>> {
+    let mut warned = false;
+    loop {
+        let shared = pereprava_nfs::SharedMtpNfs(nfs.clone());
+        match pereprava_nfs::fernfs::tcp::NFSTcpListener::bind(&format!("127.0.0.1:{port}"), shared)
+            .await
+        {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if !warned {
+                    eprintln!(
+                        "watch: port {port} is already served by another pereprava \
+                         instance; waiting for it to exit"
+                    );
+                    warned = true;
+                }
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => bail!("interrupted while waiting for port {port}"),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("binding NFS server on 127.0.0.1:{port}"));
+            }
+        }
+    }
+}
+
+/// True when `path` is an active mount point: on macOS a mounted filesystem
+/// reports a device different from its parent directory.
+fn is_mounted(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("/"));
+    match (std::fs::metadata(path), std::fs::metadata(parent)) {
+        (Ok(child), Ok(up)) => child.dev() != up.dev(),
+        _ => false,
+    }
 }
 
 /// Writes the menu-bar status file atomically.
