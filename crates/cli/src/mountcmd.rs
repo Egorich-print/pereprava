@@ -149,7 +149,9 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
                         last_model = model;
                         state = "attached";
                         println!("phone attached ({last_model})");
-                        if !mounted || !is_mounted(std::path::Path::new(&used_path)) {
+                        if !mounted || !is_alive_mount(std::path::Path::new(&used_path)) {
+                            // Our own dead mount may still hold the path.
+                            clear_stale_mounts(&path).await;
                             match pereprava_nfs::mount(port, &path).await {
                                 Ok(used) => {
                                     mounted = true;
@@ -245,16 +247,29 @@ async fn bind_nfs(
     }
 }
 
+/// Which of `base`'s candidate paths the kernel currently has mounted.
+///
+/// Parses `mount(8)` output on purpose: a stale NFS mount answers `stat` and
+/// `statfs` with `ESTALE`, so the usual device-number comparison reports
+/// "not mounted" for the exact case we need to clean up.
+async fn active_mounts(base: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(out) = tokio::process::Command::new("/sbin/mount").output().await else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    pereprava_nfs::mount_candidates(base)
+        .into_iter()
+        .filter(|p| text.contains(&format!(" on {} (", p.display())))
+        .collect()
+}
+
 /// Best-effort force-unmount of leftover mounts for `base` and its fallbacks.
 ///
 /// Inside the daemon this runs as root, so it succeeds without any prompt;
 /// as a normal user it fails harmlessly and the mount fallback takes over.
 /// Arguments are passed as argv, never through a shell.
 async fn clear_stale_mounts(base: &std::path::Path) {
-    for path in pereprava_nfs::mount_candidates(base) {
-        if !is_mounted(&path) {
-            continue;
-        }
+    for path in active_mounts(base).await {
         match tokio::process::Command::new("/sbin/umount")
             .arg("-f")
             .arg(&path)
@@ -269,9 +284,10 @@ async fn clear_stale_mounts(base: &std::path::Path) {
     }
 }
 
-/// True when `path` is an active mount point: on macOS a mounted filesystem
-/// reports a device different from its parent directory.
-fn is_mounted(path: &std::path::Path) -> bool {
+/// True when `path` is a responsive mount point (device differs from its
+/// parent). A stale mount fails the metadata lookup and reports `false`, which
+/// is what makes the watcher remount after its server dies.
+fn is_alive_mount(path: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("/"));
     match (std::fs::metadata(path), std::fs::metadata(parent)) {
