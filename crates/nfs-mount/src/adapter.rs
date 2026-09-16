@@ -251,7 +251,10 @@ impl MtpNfs {
         let mut off = 0u64;
         const CHUNK: u32 = 1024 * 1024;
         while off < size {
-            let want = CHUNK.min((size - off) as u32);
+            // Clamp before the cast: `(size - off) as u32` truncates for
+            // objects at or beyond 4 GiB, and a zero-length window would end
+            // the loop with a truncated stage.
+            let want = u32::try_from((size - off).min(u64::from(CHUNK))).unwrap_or(CHUNK);
             let dev = self.dev()?;
             let data = dev
                 .hread_range(d.storage_index, d.handle, off, want)
@@ -292,7 +295,12 @@ impl MtpNfs {
         Ok(())
     }
 
-    /// Registers a fresh (empty) staged file under `dirid`.
+    /// Registers a freshly created staged file under `dirid`.
+    ///
+    /// When the name already exists on the device its content is pulled into
+    /// the stage first: NFSv3 CREATE must not truncate (the kernel issues a
+    /// separate SETATTR for `O_TRUNC`), so an empty stage here would silently
+    /// wipe the file on the next COMMIT.
     async fn stage_new(
         &self,
         dirid: u64,
@@ -307,65 +315,66 @@ impl MtpNfs {
             return Err(nfs3::nfsstat3::NFS3ERR_INVAL);
         }
 
-        // Async device probe BEFORE taking the lock (guard must not cross await).
-        let existing_dev = self.lookup(dirid, filename).await.ok().and_then(|dev_id| {
-            self.device_handle_of(dev_id)
-                .map(|(idx, h)| (dev_id, idx, h))
-        });
+        // Reuse an already-staged entry with the same name (no await held).
+        {
+            let mut st = self
+                .inner
+                .staged
+                .lock()
+                .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+            for (vid, s) in st.iter_mut() {
+                if s.parent_id == dirid && names_eq_ci(&s.name, &name) {
+                    return Ok(*vid);
+                }
+            }
+        }
 
+        // Existing device object: stage its content instead of clobbering it.
+        if let Ok(dev_id) = self.lookup(dirid, filename).await
+            && let Some((idx, handle)) = self.device_handle_of(dev_id)
+        {
+            let dev = self.dev()?;
+            let info = dev.hinfo(idx, handle).await.map_err(nfserr)?;
+            if info.is_dir {
+                return Err(nfs3::nfsstat3::NFS3ERR_EXIST);
+            }
+            self.ensure_staged_existing(
+                dev_id,
+                Decoded {
+                    storage_index: idx,
+                    handle,
+                },
+                info.name.clone(),
+                dirid,
+                info.size,
+            )
+            .await?;
+            return Ok(dev_id);
+        }
+
+        // Brand-new file: empty stage; storage index is resolved at flush.
+        let id = self.next_virt_id();
+        let tmp = self.tmp_path_for(id);
+        std::fs::File::create(&tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
         let mut st = self
             .inner
             .staged
             .lock()
             .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
-
-        // Reuse an already-staged entry with the same name.
-        for (vid, s) in st.iter_mut() {
-            if s.parent_id == dirid && names_eq_ci(&s.name, &name) {
-                return Ok(*vid);
-            }
-        }
-
-        match existing_dev {
-            Some((dev_id, idx, h)) => {
-                // Overwrite of an existing object: original is doomed at flush.
-                let tmp = self.tmp_path_for(dev_id);
-                std::fs::File::create(&tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
-                st.insert(
-                    dev_id,
-                    Stage {
-                        tmp,
-                        storage_index: idx,
-                        parent_id: dirid,
-                        name,
-                        size: 0,
-                        origin_dev: Some(h.0),
-                        flushed_dev: None,
-                        dirty: true,
-                    },
-                );
-                Ok(dev_id)
-            }
-            None => {
-                let id = self.next_virt_id();
-                let tmp = self.tmp_path_for(id);
-                std::fs::File::create(&tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
-                st.insert(
-                    id,
-                    Stage {
-                        tmp,
-                        storage_index: 0, // resolved from the parent at flush time
-                        parent_id: dirid,
-                        name,
-                        size: 0,
-                        origin_dev: None,
-                        flushed_dev: None,
-                        dirty: true,
-                    },
-                );
-                Ok(id)
-            }
-        }
+        st.insert(
+            id,
+            Stage {
+                tmp,
+                storage_index: 0,
+                parent_id: dirid,
+                name,
+                size: 0,
+                origin_dev: None,
+                flushed_dev: None,
+                dirty: true,
+            },
+        );
+        Ok(id)
     }
 
     /// Guarantees a staging slot exists for `id` before writes are applied.
@@ -382,6 +391,11 @@ impl MtpNfs {
             Some(Kind::Real(d)) => {
                 let dev = self.dev()?;
                 let info = dev.hinfo(d.storage_index, d.handle).await.map_err(nfserr)?;
+                // Never stage a directory as a file: a later flush would
+                // delete the real directory and upload a regular file.
+                if info.is_dir {
+                    return Err(nfs3::nfsstat3::NFS3ERR_ISDIR);
+                }
                 // Parent NFS id from the object's recorded parent handle.
                 let parent_id = if info.parent == 0 {
                     STORAGE_BASE_ID + d.storage_index as u64
@@ -407,23 +421,34 @@ impl MtpNfs {
             st.get(&id).map(|s| {
                 (
                     s.tmp.clone(),
-                    s.storage_index,
                     s.parent_id,
                     s.name.clone(),
                     s.size,
-                    s.origin_dev,
+                    // The object currently on the device is the latest flush if
+                    // one happened, otherwise the original. Deleting the wrong
+                    // one orphans a copy on the phone (duplicate on recommit).
+                    s.flushed_dev.or(s.origin_dev),
+                    s.dirty,
                 )
             })
         };
-        let Some((tmp, idx, parent_id, name, size, origin_dev)) = snapshot else {
+        let Some((tmp, parent_id, name, size, prev_dev, dirty)) = snapshot else {
             return Ok(());
         };
-        // Parent must be resolvable to a real handle.
-        let (_p_idx, p_handle) = self.parent_handle_of(parent_id)?;
+        // A recommit with no intervening writes must not re-upload: doing so
+        // would leave the previous upload orphaned as a duplicate.
+        if !dirty {
+            return Ok(());
+        }
+        // Parent resolves both the destination handle and the *real* storage
+        // index: `stage_new` records 0 as a placeholder, so uploading by
+        // `s.storage_index` would silently target storage 0 (e.g. internal
+        // instead of an SD card).
+        let (p_idx, p_handle) = self.parent_handle_of(parent_id)?;
 
         let dev = self.dev()?;
-        if let Some(old) = origin_dev {
-            let _ = dev.hdelete(idx, ObjectHandle(old)).await; // NotFound is fine
+        if let Some(old) = prev_dev {
+            let _ = dev.hdelete(p_idx, ObjectHandle(old)).await; // NotFound is fine
         }
         let file = tokio::fs::File::open(&tmp)
             .await
@@ -431,7 +456,7 @@ impl MtpNfs {
         let dev = self.dev()?;
         let new_entry = dev
             .hupload(
-                idx,
+                p_idx,
                 p_handle,
                 &name,
                 size,
@@ -451,7 +476,11 @@ impl MtpNfs {
             .lock()
             .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
         if let Some(s) = st.get_mut(&id) {
+            // The device now holds exactly this upload; forget the origin so a
+            // future flush deletes this copy rather than a stale one.
+            s.origin_dev = None;
             s.flushed_dev = Some(new_entry.handle);
+            s.storage_index = p_idx;
             s.dirty = false;
             s.size = size;
         }
@@ -479,12 +508,20 @@ impl MtpNfs {
     }
 
     /// Drops the session (device gone). Staged files are kept on disk.
+    ///
+    /// The old actor is force-closed: the caller only reaches this path after
+    /// a probe already timed out, so a graceful `close()` would hang behind
+    /// the wedged request and keep the USB claim.
     pub fn detach(&self) {
-        *self
+        let old = self
             .inner
             .sess
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(dev) = old {
+            dev.force_close();
+        }
     }
 
     /// Whether a device session is currently installed.
@@ -494,11 +531,16 @@ impl MtpNfs {
     }
 
     /// Cheap session health probe: `true` when the device answers GetDeviceInfo.
+    ///
+    /// Bounded so a wedged USB transfer cannot freeze the watch loop.
     pub async fn test_session(&self) -> bool {
         let Some(dev) = self.inner.sess.read().ok().and_then(|g| g.clone()) else {
             return false;
         };
-        dev.info().await.is_ok()
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), dev.info()).await,
+            Ok(Ok(_))
+        )
     }
 
     fn attr_for(&self, id: u64, is_dir: bool, size: u64) -> nfs3::fattr3 {
@@ -601,7 +643,7 @@ impl NFSFileSystem for MtpNfs {
             Some(Kind::StorageRoot(idx)) => {
                 let st = self.inner.storages.read().await;
                 match st.get(idx) {
-                    Some(s) => Ok(self.attr_for(id, true, s.capacity - s.free)),
+                    Some(s) => Ok(self.attr_for(id, true, s.capacity.saturating_sub(s.free))),
                     None => Err(nfs3::nfsstat3::NFS3ERR_BADHANDLE),
                 }
             }
@@ -668,11 +710,14 @@ impl NFSFileSystem for MtpNfs {
                 let mut f = std::fs::File::open(&s.tmp).map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
                 let total = f.metadata().map(|m| m.len()).unwrap_or(s.size);
                 let mut buf = vec![0u8; count as usize];
-                f.seek(SeekFrom::Start(offset))
+                let n = f
+                    .seek(SeekFrom::Start(offset))
                     .and_then(|_| f.read(&mut buf))
                     .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
-                let eof = offset + buf.len() as u64 >= total;
-                buf.truncate(buf.len());
+                // Honor the actual read length: `read` may fill fewer bytes,
+                // and the tail of `buf` would otherwise be served as zeros.
+                buf.truncate(n);
+                let eof = offset.saturating_add(n as u64) >= total;
                 return Ok((buf, eof));
             }
         }
@@ -680,6 +725,9 @@ impl NFSFileSystem for MtpNfs {
             Some(Kind::Real(d)) => {
                 let dev = self.dev()?;
                 let info = dev.hinfo(d.storage_index, d.handle).await.map_err(nfserr)?;
+                if info.is_dir {
+                    return Err(nfs3::nfsstat3::NFS3ERR_ISDIR);
+                }
                 // Kernel clients may speculatively read past EOF; Android
                 // answers GetPartialObject out-of-range with an error, so
                 // clamp to the object bounds ourselves.
@@ -708,7 +756,7 @@ impl NFSFileSystem for MtpNfs {
         id: nfs3::fileid3,
         offset: u64,
         data: &[u8],
-        stable: fernfs::protocol::xdr::nfs3::file::stable_how,
+        _stable: fernfs::protocol::xdr::nfs3::file::stable_how,
     ) -> Result<(nfs3::fattr3, nfs3::file::stable_how, nfs3::count3), nfs3::nfsstat3> {
         if !self.inner.writable {
             return Err(nfs3::nfsstat3::NFS3ERR_ROFS);
@@ -731,11 +779,15 @@ impl NFSFileSystem for MtpNfs {
             f.seek(SeekFrom::Start(offset))
                 .and_then(|_| f.write_all(data))
                 .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
-            s.size = s.size.max(offset + data.len() as u64);
+            s.size = s.size.max(offset.saturating_add(data.len() as u64));
             s.dirty = true;
             let attr = self.attr_for(id, false, s.size);
             drop(st);
-            return Ok((attr, stable, data.len() as u32));
+            // Data lives only in the local stage until COMMIT, so we must
+            // report UNSTABLE even when the client asked for FILE_SYNC —
+            // otherwise the kernel may skip the COMMIT and the write never
+            // reaches the phone.
+            return Ok((attr, nfs3::file::stable_how::UNSTABLE, data.len() as u32));
         }
     }
 
@@ -743,10 +795,15 @@ impl NFSFileSystem for MtpNfs {
         &self,
         dirid: nfs3::fileid3,
         filename: &nfs3::filename3,
-        _attr: nfs3::sattr3,
+        attr: nfs3::sattr3,
     ) -> Result<(nfs3::fileid3, nfs3::fattr3), nfs3::nfsstat3> {
         let id = self.stage_new(dirid, filename).await?;
-        Ok((id, self.attr_for(id, false, 0)))
+        // CREATE must not truncate, but an explicit `size` (O_TRUNC) is
+        // honored. MTP has no equivalent for the other attributes.
+        if attr.size.is_some() {
+            self.setattr(id, attr).await?;
+        }
+        Ok((id, self.getattr(id).await?))
     }
 
     async fn create_exclusive(
@@ -790,12 +847,23 @@ impl NFSFileSystem for MtpNfs {
         }
         let name = String::from_utf8_lossy(filename).to_string();
 
-        // Staged-but-unflushed: discard the stage, nothing on the device.
-        if let Some(virt_id) = self.staged_lookup(dirid, &name) {
-            if let Ok(mut st) = self.inner.staged.lock()
-                && let Some(s) = st.remove(&virt_id)
-            {
+        // Staged entry: discard the local copy and, when it was already
+        // flushed, delete the device object too — otherwise a file deleted
+        // from Finder would reappear on the phone after a remount.
+        if let Some(stage_id) = self.staged_lookup(dirid, &name) {
+            let removed = if let Ok(mut st) = self.inner.staged.lock() {
+                st.remove(&stage_id)
+            } else {
+                None
+            };
+            if let Some(s) = removed {
                 drop(std::fs::remove_file(&s.tmp));
+                if let Some(handle) = s.flushed_dev.or(s.origin_dev) {
+                    let dev = self.dev()?;
+                    dev.hdelete(s.storage_index, ObjectHandle(handle))
+                        .await
+                        .map_err(nfserr)?;
+                }
             }
             return Ok(());
         }
@@ -884,7 +952,7 @@ impl NFSFileSystem for MtpNfs {
                         STORAGE_BASE_ID + i as u64,
                         s.description.clone(),
                         true,
-                        s.capacity - s.free,
+                        s.capacity.saturating_sub(s.free),
                     ));
                 }
             }
