@@ -114,9 +114,14 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
     let mut prev_counters = nfs.stats();
     let mut prev_instant = std::time::Instant::now();
     write_status_file("waiting", "", "", 0, 0, 0, 0);
+    // launchd stops the job with SIGTERM; without catching it the process dies
+    // abruptly and abandons its NFS mount as a stale entry.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing a SIGTERM handler")?;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = sigterm.recv() => break,
             _ = tokio::time::sleep(poll) => {}
         }
 
@@ -205,7 +210,16 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
         );
     }
 
-    println!("watch stopped: detaching session (volume left as-is)");
+    println!("watch stopped: detaching session and releasing the volume");
+    nfs.detach();
+    if mounted {
+        let mp = std::path::Path::new(&used_path);
+        match force_unmount(mp).await {
+            Ok(()) => println!("unmounted {}", mp.display()),
+            Err(e) => eprintln!("warning: could not unmount {}: {e}", mp.display()),
+        }
+    }
+    write_status_file("stopped", "", "", 0, 0, 0, 0);
     server.abort();
     Ok(())
 }
@@ -263,6 +277,31 @@ async fn active_mounts(base: &std::path::Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Force-unmounts `path`, trying `umount(8)` then `diskutil`.
+///
+/// macOS is notoriously stubborn about stale NFS mounts; `diskutil unmount
+/// force` succeeds in some cases where `umount -f` does not.
+async fn force_unmount(path: &std::path::Path) -> std::result::Result<(), String> {
+    let attempts: [(&str, &[&str]); 2] = [
+        ("/sbin/umount", &["-f"]),
+        ("/usr/sbin/diskutil", &["unmount", "force"]),
+    ];
+    let mut last = String::from("no attempt made");
+    for (prog, args) in attempts {
+        match tokio::process::Command::new(prog)
+            .args(args)
+            .arg(path)
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => last = format!("{prog}: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            Err(e) => last = format!("{prog}: {e}"),
+        }
+    }
+    Err(last)
+}
+
 /// Best-effort force-unmount of leftover mounts for `base` and its fallbacks.
 ///
 /// Inside the daemon this runs as root, so it succeeds without any prompt;
@@ -270,16 +309,12 @@ async fn active_mounts(base: &std::path::Path) -> Vec<PathBuf> {
 /// Arguments are passed as argv, never through a shell.
 async fn clear_stale_mounts(base: &std::path::Path) {
     for path in active_mounts(base).await {
-        match tokio::process::Command::new("/sbin/umount")
-            .arg("-f")
-            .arg(&path)
-            .output()
-            .await
-        {
-            Ok(out) if out.status.success() => {
-                println!("cleared a stale mount at {}", path.display());
-            }
-            _ => tracing::debug!("could not clear stale mount at {}", path.display()),
+        match force_unmount(&path).await {
+            Ok(()) => println!("cleared a stale mount at {}", path.display()),
+            Err(e) => eprintln!(
+                "warning: could not clear stale mount at {}: {e}",
+                path.display()
+            ),
         }
     }
 }
