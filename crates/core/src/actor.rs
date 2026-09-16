@@ -53,6 +53,12 @@ pub struct Resolved {
 enum Request {
     /// Stops the actor loop and closes the device session.
     Shutdown,
+    /// Real device round-trip used as a liveness probe.
+    ///
+    /// [`DeviceHandle::info`] and `storages` are served from the actor's cached
+    /// state and therefore never notice a disconnected phone; this one asks the
+    /// device to enumerate a storage root.
+    Ping { reply: oneshot::Sender<Result<()>> },
     /// Handle-based listing for the NFS adapter (bypasses path parsing).
     HList {
         storage_index: usize,
@@ -417,8 +423,16 @@ impl DeviceHandle {
     }
 
     /// Device + storages summary.
+    ///
+    /// Served from actor state captured at connect time; it does **not** check
+    /// that the phone is still there. Use [`ping`](Self::ping) for liveness.
     pub async fn info(&self) -> Result<DeviceSummary> {
         self.call(|reply| Request::Info { reply }).await
+    }
+
+    /// Liveness probe: forces a real MTP round-trip to the device.
+    pub async fn ping(&self) -> Result<()> {
+        self.call(|reply| Request::Ping { reply }).await
     }
 
     /// Lists a directory. `path = "/"` lists storages.
@@ -769,6 +783,13 @@ impl ActorState {
                         writable: s.writable,
                     })
                     .collect()));
+            }
+            Request::Ping { reply } => {
+                let out = match self.open_storage(0).await {
+                    Ok(st) => st.list_objects(None).await.map(|_| ()).map_err(Error::from),
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(out);
             }
             Request::Info { reply } => {
                 let _ = reply.send(Ok(self.summary()));

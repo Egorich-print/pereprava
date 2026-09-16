@@ -530,16 +530,18 @@ impl MtpNfs {
         self.inner.sess.read().map(|g| g.is_some()).unwrap_or(false)
     }
 
-    /// Cheap session health probe: `true` when the device answers GetDeviceInfo.
+    /// Session health probe: `true` when the device answers a real MTP request.
     ///
+    /// Must not use `info()`/`storages()` — the actor serves those from cached
+    /// state and would keep reporting a phone that is no longer connected.
     /// Bounded so a wedged USB transfer cannot freeze the watch loop.
     pub async fn test_session(&self) -> bool {
         let Some(dev) = self.inner.sess.read().ok().and_then(|g| g.clone()) else {
             return false;
         };
         matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), dev.info()).await,
-            Ok(Ok(_))
+            tokio::time::timeout(std::time::Duration::from_secs(5), dev.ping()).await,
+            Ok(Ok(()))
         )
     }
 
