@@ -94,6 +94,10 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
         std::sync::Arc::new(MtpNfs::new_detached(!read_only).context("preparing the NFS adapter")?);
 
     let listener = bind_nfs(port, &nfs).await?;
+    // A previous daemon generation can leave dead NFS mounts behind (base and
+    // `-2`..`-9`); without this the new instance is pushed further out every
+    // restart. We hold the port, so nothing we can see is serving them.
+    clear_stale_mounts(&path).await;
     let server = tokio::spawn(async move {
         use pereprava_nfs::fernfs::tcp::NFSTcp;
         if let Err(e) = listener.handle_forever().await {
@@ -237,6 +241,30 @@ async fn bind_nfs(
             Err(e) => {
                 return Err(e).with_context(|| format!("binding NFS server on 127.0.0.1:{port}"));
             }
+        }
+    }
+}
+
+/// Best-effort force-unmount of leftover mounts for `base` and its fallbacks.
+///
+/// Inside the daemon this runs as root, so it succeeds without any prompt;
+/// as a normal user it fails harmlessly and the mount fallback takes over.
+/// Arguments are passed as argv, never through a shell.
+async fn clear_stale_mounts(base: &std::path::Path) {
+    for path in pereprava_nfs::mount_candidates(base) {
+        if !is_mounted(&path) {
+            continue;
+        }
+        match tokio::process::Command::new("/sbin/umount")
+            .arg("-f")
+            .arg(&path)
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                println!("cleared a stale mount at {}", path.display());
+            }
+            _ => tracing::debug!("could not clear stale mount at {}", path.display()),
         }
     }
 }

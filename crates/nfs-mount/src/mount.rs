@@ -27,7 +27,11 @@ fn osascript_escape(script: &str) -> String {
 ///
 /// Stale/hung mounts left by earlier runs occupy the base path and cannot be
 /// removed without root, so the watcher falls back instead of wedging.
-fn candidates(mount_point: &Path) -> Vec<PathBuf> {
+///
+/// Public so callers can also enumerate (and clean up) mounts a previous
+/// generation may have left behind.
+#[must_use]
+pub fn mount_candidates(mount_point: &Path) -> Vec<PathBuf> {
     let mut out = vec![mount_point.to_path_buf()];
     let name = mount_point
         .file_name()
@@ -49,7 +53,7 @@ fn candidates(mount_point: &Path) -> Vec<PathBuf> {
 /// Fails when every candidate path is exhausted or authorization is denied.
 pub async fn mount(port: u16, mount_point: &Path) -> Result<PathBuf> {
     let mut script = String::new();
-    for c in candidates(mount_point) {
+    for c in mount_candidates(mount_point) {
         let mp = sh_quote(&c.display().to_string());
         // `soft` keeps a dead phone from wedging the volume permanently
         // (hard NFS + vanished USB = unkillable mount); retries stay modest.
@@ -143,7 +147,7 @@ mod tests {
 
     #[test]
     fn fallback_candidates_are_numbered() {
-        let c = candidates(Path::new("/Volumes/pereprava"));
+        let c = mount_candidates(Path::new("/Volumes/pereprava"));
         assert_eq!(c[0], PathBuf::from("/Volumes/pereprava"));
         assert_eq!(c[1], PathBuf::from("/Volumes/pereprava-2"));
         assert_eq!(c.last().unwrap(), &PathBuf::from("/Volumes/pereprava-9"));

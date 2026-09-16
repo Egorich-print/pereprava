@@ -12,4 +12,4 @@ pub mod mount;
 pub use fernfs;
 
 pub use adapter::{MtpNfs, SharedMtpNfs};
-pub use mount::{mount, unmount};
+pub use mount::{mount, mount_candidates, unmount};
