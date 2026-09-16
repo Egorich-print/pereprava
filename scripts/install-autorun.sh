@@ -97,3 +97,6 @@ launchctl bootstrap gui/$UID "$WIDGET_PLIST" && echo "виджет запуще�
 
 echo "done. Daemon log: $LOG"
 echo "Phone will auto-appear in Finder on every connection."
+echo
+echo "NOTE (macOS 26 Tahoe): if the menu-bar icon does not appear, enable"
+echo "  System Settings -> Menu Bar -> Allow in the Menu Bar -> Pereprava."

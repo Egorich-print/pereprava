@@ -82,6 +82,11 @@ first mount — and installs **Pereprava.app**, a menu-bar widget built with
 live transfer rates, cumulative totals and the mount point, with open/unmount
 actions. The daemon publishes `/tmp/pereprava-status.json` for it.
 
+> **macOS 26 (Tahoe) first run:** the system gates menu-bar icons behind
+> `System Settings → Menu Bar → Allow in the Menu Bar`. Until **Pereprava** is
+> toggled on there, macOS starts the app normally but silently refuses to draw
+> the icon. Same for any other menu-bar agent.
+
 ```
 crates/
 ├── core/        protocol actor, caching, path/name handling
