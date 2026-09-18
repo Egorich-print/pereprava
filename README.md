@@ -27,8 +27,10 @@ See [docs/adr/ADR-000-clean-room-and-safety-policy.md](docs/adr/ADR-000-clean-ro
 
 ## Status
 
-Early development — see [STATUS.md](STATUS.md) and the
-[feature notes](docs/status/). Roadmap lives in STATUS.md too.
+Active development — see [STATUS.md](STATUS.md) and the
+[history notes](docs/history/). Architecture and decisions:
+[docs/architecture/overview.md](docs/architecture/overview.md),
+[docs/adr/](docs/adr/).
 
 ## Install (from source)
 

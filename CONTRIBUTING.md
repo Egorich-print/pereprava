@@ -23,4 +23,5 @@ PEREPRAVA_DEVICE=1 cargo test -p pereprava-core --test device -- --ignored --tes
 
 - `STATUS.md` — current state (single source of truth).
 - `CHANGELOG.md` — what changed.
-- `docs/status/*.md` — feature notes / state snapshots.
+- `docs/history/*.md` — dated feature notes / state snapshots.
+- `docs/architecture/` — system overview (update when the shape changes).
