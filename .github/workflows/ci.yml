@@ -7,9 +7,31 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
   check:
+    name: workspace (fmt, clippy, test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings; workspace lints already deny unwrap/expect/panic)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests (unit only; device tests are gated behind PEREPRAVA_DEVICE)
+        run: cargo test --workspace --locked
+      - name: Dependency audit (advisories)
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check advisories
+
+  widget:
+    name: widget (tauri + svelte)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,13 +39,21 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format check
-        run: cargo fmt --all --check
-      - name: Clippy (deny unwrap/expect/panic)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Tests (unit only; device tests are gated)
-        run: cargo test --workspace
-      - name: Dependency audit
+        with:
+          workspaces: crates/widget
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/widget/ui/package-lock.json
+      - name: Frontend install + build
+        working-directory: crates/widget/ui
         run: |
-          cargo install cargo-deny --locked || true
-          cargo deny check advisories 2>/dev/null || true
+          npm ci
+          npm run build
+      - name: Widget clippy
+        working-directory: crates/widget
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Widget build (validates capabilities + tauri config)
+        working-directory: crates/widget
+        run: cargo tauri build --ci
