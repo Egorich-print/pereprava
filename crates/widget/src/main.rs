@@ -34,13 +34,40 @@ struct Status {
     speed_rx: u64,
     #[serde(default)]
     speed_tx: u64,
+    /// Unix seconds when the daemon wrote this snapshot.
+    #[serde(default)]
+    ts: u64,
+}
+
+/// A snapshot older than this means the daemon is gone: the last values are
+/// history, not current state, so they must not be shown as "attached".
+const STALE_AFTER_SECS: u64 = 15;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 fn read_status() -> Status {
-    std::fs::read_to_string(STATUS_FILE)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    let raw = match std::fs::read_to_string(STATUS_FILE) {
+        Ok(r) => r,
+        Err(_) => return Status::default(),
+    };
+    let status: Status = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(_) => return Status::default(),
+    };
+    // Freshness: a dead daemon must not keep showing a live volume.
+    if status.ts != 0 && now_secs().saturating_sub(status.ts) > STALE_AFTER_SECS {
+        return Status {
+            state: "stale".to_string(),
+            ts: status.ts,
+            ..Status::default()
+        };
+    }
+    status
 }
 
 /// POSIX single-quote escaping so a mount path can never break the shell.
@@ -53,6 +80,8 @@ fn open_mounted() -> Result<(), String> {
     if path.is_empty() {
         return Err("том не смонтирован".into());
     }
+    // Spawn (do not wait): `open` returns immediately and we do not want the
+    // command handler blocked on a slow launch.
     std::process::Command::new("open")
         .arg(&path)
         .spawn()
@@ -60,28 +89,41 @@ fn open_mounted() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn unmount_mounted() -> Result<(), String> {
+/// Unmounts the current volume, escalating the way the CLI daemon does.
+///
+/// Blocking on `osascript` waits for the administrator dialog, so every
+/// entry point that can reach this runs it off the UI thread.
+async fn unmount_mounted_async() -> Result<(), String> {
     let path = read_status().mounted;
     if path.is_empty() {
         return Err("том не смонтирован".into());
     }
-    let script = format!(
-        "/sbin/umount {} || /sbin/umount -f {}",
-        sh_quote(&path),
-        sh_quote(&path)
-    );
+    let q = sh_quote(&path);
+    // Plain umount first (clean detach), then -f, then diskutil for the
+    // wedged-NFS cases the CLI relies on.
+    let script =
+        format!("/sbin/umount {q} 2>/dev/null || /sbin/umount -f {q} 2>/dev/null || /usr/sbin/diskutil unmount force {q}");
     let escaped = script.replace('\\', "\\\\").replace('"', "\\\"");
-    let out = std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(format!(
-            "do shell script \"{escaped}\" with administrator privileges"
-        ))
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(format!(
+                "do shell script \"{escaped}\" with administrator privileges"
+            ))
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "не удалось размонтировать".into()
+        } else {
+            err
+        })
     }
 }
 
@@ -96,15 +138,25 @@ fn open_volume() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn unmount_volume() -> Result<(), String> {
-    unmount_mounted()
+async fn unmount_volume() -> Result<(), String> {
+    unmount_mounted_async().await
 }
 
 fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// Quits the widget.
+///
+/// The LaunchAgent is configured with `KeepAlive = { SuccessfulExit: false }`
+/// (restart on crash only), so a clean `exit(0)` from here is a real quit and
+/// is not immediately respawned by launchd.
+fn quit_app(app: &AppHandle) {
+    app.exit(0);
 }
 
 fn main() {
@@ -141,9 +193,18 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_window(app),
-                    "open_volume" => drop(open_mounted()),
-                    "unmount" => drop(unmount_mounted()),
-                    "quit" => app.exit(0),
+                    "open_volume" => {
+                        let _ = open_mounted();
+                    }
+                    "unmount" => {
+                        // Off the UI thread: waits on the admin dialog.
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = unmount_mounted_async().await;
+                            let _ = handle;
+                        });
+                    }
+                    "quit" => quit_app(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -166,6 +227,19 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
             });
+
+            // Closing the dashboard must not kill the tray app: hide instead.
+            if let Some(window) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Some(w) = handle.get_webview_window("main") {
+                            let _ = w.hide();
+                        }
+                    }
+                });
+            }
 
             Ok(())
         })

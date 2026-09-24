@@ -14,33 +14,42 @@
   };
 
   let status = $state({ ...EMPTY });
-  let error = $state("");
+  let actionError = $state("");
+  let pending = $state(false);
   let unlisten;
 
   onMount(async () => {
     try {
       status = await invoke("get_status");
     } catch (e) {
-      error = String(e);
+      actionError = String(e);
     }
-    unlisten = await listen("status", (event) => {
-      status = event.payload;
-      error = "";
-    });
+    try {
+      unlisten = await listen("status", (event) => {
+        status = event.payload;
+      });
+    } catch (e) {
+      actionError = `события статуса недоступны: ${e}`;
+    }
   });
 
   onDestroy(() => unlisten?.());
 
   const attached = $derived(status.state === "attached");
   const gone = $derived(status.state === "gone");
+  const stale = $derived(status.state === "stale");
   const busy = $derived(status.speed_rx + status.speed_tx > 0);
-  const icon = $derived(attached ? (busy ? "🌉⇅" : "🌉") : gone ? "💤" : "🚧");
+  const icon = $derived(
+    attached ? (busy ? "🌉⇅" : "🌉") : gone ? "💤" : stale ? "⚠️" : "🚧",
+  );
   const headline = $derived(
     attached
       ? status.model || "телефон"
       : gone
         ? "телефон отключён"
-        : "жду телефон",
+        : stale
+          ? "демон не отвечает"
+          : "жду телефон",
   );
   const subline = $derived(
     attached
@@ -49,13 +58,18 @@
         : "том готовится…"
       : gone
         ? "настройки сохранены — подключите кабель"
-        : "кабель + режим «Передача файлов»",
+        : stale
+          ? "статус устарел — перезапустите демон"
+          : "кабель + режим «Передача файлов»",
   );
+  // Actions need a live snapshot, not a stale mount path.
+  const canAct = $derived(attached && !pending);
 
   function rate(bps) {
     if (!bps) return "—";
+    if (bps < 1024) return `${bps} B/s`;
     const mib = bps / (1024 * 1024);
-    return mib >= 1 ? `${mib.toFixed(1)} MiB/s` : `${Math.round(bps / 1024)} KiB/s`;
+    return mib >= 1 ? `${mib.toFixed(1)} MiB/s` : `${(bps / 1024).toFixed(0)} KiB/s`;
   }
 
   function size(bytes) {
@@ -71,11 +85,15 @@
   }
 
   async function act(command) {
-    error = "";
+    if (pending) return;
+    actionError = "";
+    pending = true;
     try {
       await invoke(command);
     } catch (e) {
-      error = String(e);
+      actionError = String(e);
+    } finally {
+      pending = false;
     }
   }
 </script>
@@ -89,8 +107,8 @@
   </header>
 
   <section class="hero">
-    <div class="glyph" class:busy>{icon}</div>
-    <div class="who">
+    <div class="glyph" class:busy aria-hidden="true">{icon}</div>
+    <div class="who" aria-live="polite">
       <h1>{headline}</h1>
       <p>{subline}</p>
     </div>
@@ -114,16 +132,16 @@
     <code>{status.mounted || "—"}</code>
   </section>
 
-  {#if error}
-    <p class="error">{error}</p>
+  {#if actionError}
+    <p class="error" role="alert">{actionError}</p>
   {/if}
 
   <section class="actions">
-    <button onclick={() => act("open_volume")} disabled={!status.mounted}>
+    <button onclick={() => act("open_volume")} disabled={!canAct}>
       Открыть том
     </button>
-    <button class="ghost" onclick={() => act("unmount_volume")} disabled={!status.mounted}>
-      Размонтировать
+    <button class="ghost" onclick={() => act("unmount_volume")} disabled={!canAct}>
+      {pending ? "Выполняется…" : "Размонтировать"}
     </button>
   </section>
 </main>
