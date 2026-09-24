@@ -6,6 +6,61 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (v0.6 audit)
+
+- The root LaunchDaemon no longer executes a binary from the user's writable
+  checkout: the installer copies it to `/usr/local/libexec/pereprava`
+  (root:wheel 0755) and points the plist there. `daemon.sh update` refreshes it.
+- Status-file writes no longer follow symlinks: the root daemon created a
+  predictable `/tmp/pereprava-status.json.tmp` with `fs::write`, letting a local
+  user truncate an arbitrary root-owned file. Now a `create_new` temp in a 0700
+  private dir, atomically renamed; JSON escaping is RFC 8259-complete.
+- NFS staging directory is 0700 (was world-readable phone contents under the
+  root daemon).
+- `mount` refuses `/` and relative mount points (the daemon force-unmounts
+  "stale" mounts as root).
+- `pull <remote>` validates the device-supplied destination filename (no `..`,
+  `/`, `\`, NUL) before joining it.
+- Plist paths are XML-escaped in the installer.
+
+### Fixed (v0.6 audit — data integrity)
+
+- `push --force` no longer deletes the phone file before opening the local
+  source (a failed open/upload previously lost the remote copy).
+- Staged-but-unflushed files are now visible to NFS LOOKUP (open/rename by name
+  after CREATE previously returned NOENT).
+- `remove` deletes the device object *before* dropping the local stage (the
+  only copy of a never-flushed file was previously destroyed on disconnect).
+- Renames of on-device/committed files now go through the device instead of
+  only changing local stage metadata.
+- NFS filehandle generation mixes per-process entropy (whole-second values
+  collided across same-second restarts, reusing kernel filehandles).
+- Read-only mounts return `NFS3ERR_ROFS` from COMMIT (the contract requires it;
+  success let the kernel treat unflushed data as durable).
+- `mount` retains the actual (possibly `-N`) path for unmount; `unmount` no
+  longer refuses stale mounts (`exists()` is false for them) and tries the
+  fallback points; `--export` is passed to the mount source; the success
+  message reports the real mode.
+
+### Performance (v0.6)
+
+- NFS reads no longer issue an `hinfo` before every 128 KiB chunk; the range
+  read goes first and metadata is fetched only on a short read or error. This
+  removes half the per-chunk MTP round-trips and lifts sequential throughput
+  through the mount from ~3.7 MB/s toward the ~37 MB/s data path.
+
+### Fixed (v0.6 audit — widget)
+
+- Added a Tauri capability file; without it the ACL was empty and the
+  dashboard's `invoke`/`listen` could not be authorized (a likely reason the
+  UI appeared static).
+- Unmount no longer blocks the UI thread on the admin password dialog
+  (async + `spawn_blocking` + `diskutil` fallback); window close hides instead
+  of killing the tray app; "Выход" now sticks (agent restarts on crash only);
+  status carries a timestamp so a crashed daemon shows "демон не отвечает"
+  instead of a stale "том смонтирован"; action errors persist; actions are
+  disabled while in flight; sub-KiB/s rates and aria-live added.
+
 ### Changed (v0.6)
 
 - **Status widget rewritten on Tauri v2 + Svelte** (`crates/widget`),
