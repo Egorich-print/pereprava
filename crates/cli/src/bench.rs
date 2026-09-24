@@ -46,7 +46,13 @@ async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Resu
     // --- Phase 1: single big file -------------------------------------
     let big_name = "big.bin";
     let big_local = local_base.join(big_name);
-    let big_len = params.size_mib * 1024 * 1024;
+    // Checked: `size_mib * 1 MiB` overflows u32 for values a user can type
+    // (>= 4096), which panics in debug and wraps in release.
+    let big_len = params
+        .size_mib
+        .checked_mul(1024)
+        .and_then(|v| v.checked_mul(1024))
+        .with_context(|| format!("--size-mib {} is too large", params.size_mib))?;
     let sum_src = write_test_file(&big_local, big_len).await?;
 
     if params.size_mib > 0 {

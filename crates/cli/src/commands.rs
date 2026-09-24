@@ -142,7 +142,20 @@ pub async fn pull(remote: String, local: Option<String>) -> anyhow::Result<()> {
         } else {
             let file_path = match local.clone() {
                 Some(p) => PathBuf::from(p),
-                None => std::env::current_dir()?.join(resolved.entry.name.clone()),
+                None => {
+                    // The default destination comes from device-reported
+                    // metadata, so it must be a single safe component or a
+                    // crafted name could write outside the current directory.
+                    let name = &resolved.entry.name;
+                    if name.is_empty()
+                        || name == "."
+                        || name == ".."
+                        || name.contains(['/', '\\', '\0'])
+                    {
+                        bail!("device reported an unusable file name: {name:?}");
+                    }
+                    std::env::current_dir()?.join(name)
+                }
             };
             let out = tokio::fs::File::create(&file_path)
                 .await
@@ -194,6 +207,10 @@ pub async fn push(local: String, remote: Option<String>, force: bool) -> anyhow:
                 .context("local file name must be valid UTF-8")?
                 .to_string();
             let target = ops::join_device(&remote_dir, &fname);
+            // Open the local source BEFORE touching the device: a local error
+            // or an interrupted upload must never leave the phone file
+            // already deleted.
+            let file = tokio::fs::File::open(&lp).await?;
             match dev.resolve(&target).await {
                 Ok(hit) if !hit.entry.is_dir && force => {
                     dev.remove(&target, false).await?;
@@ -201,7 +218,6 @@ pub async fn push(local: String, remote: Option<String>, force: bool) -> anyhow:
                 Ok(_) => bail!("{target} already exists on device (use --force to replace)"),
                 Err(_) => {} // fresh name
             }
-            let file = tokio::fs::File::open(&lp).await?;
             let (ptx, prx) = watch::channel(Progress {
                 total: meta.len(),
                 done: 0,
