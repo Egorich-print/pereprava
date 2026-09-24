@@ -134,6 +134,9 @@ enum Cmd {
         /// Polling interval in seconds.
         #[arg(long, default_value_t = 3)]
         poll_secs: u64,
+        /// Allow NFS clients with unprivileged source ports (E2E harness only).
+        #[arg(long)]
+        allow_unprivileged_source_port: bool,
     },
 }
 
@@ -243,7 +246,17 @@ async fn main() {
             port,
             read_only,
             poll_secs,
-        } => mountcmd::watch(std::path::PathBuf::from(path), port, read_only, poll_secs).await,
+            allow_unprivileged_source_port,
+        } => {
+            mountcmd::watch(
+                std::path::PathBuf::from(path),
+                port,
+                read_only,
+                poll_secs,
+                allow_unprivileged_source_port,
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {

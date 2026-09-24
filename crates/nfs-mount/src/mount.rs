@@ -52,6 +52,36 @@ pub fn mount_candidates(mount_point: &Path) -> Vec<PathBuf> {
 /// # Errors
 /// Fails when every candidate path is exhausted or authorization is denied.
 pub async fn mount(port: u16, mount_point: &Path) -> Result<PathBuf> {
+    mount_export(port, mount_point, "/").await
+}
+
+/// [`mount`], but for a server configured with a non-default export subpath.
+///
+/// The source passed to `mount_nfs` must match the export the listener was
+/// started with, otherwise MNT resolution asks for a path the server does not
+/// export.
+pub async fn mount_export(port: u16, mount_point: &Path, export: &str) -> Result<PathBuf> {
+    // Safety: refuse to mount over the system root or a relative path. The
+    // daemon runs as root and force-unmounts "stale" mounts, so an accidental
+    // `--path /` would be destructive.
+    if mount_point == Path::new("/") {
+        bail!("refusing to use `/` as a mount point");
+    }
+    if !mount_point.is_absolute() {
+        bail!(
+            "mount point must be an absolute path: {}",
+            mount_point.display()
+        );
+    }
+    // Normalize to a leading-slash path with no trailing slash.
+    let export = if export.is_empty() || export == "/" {
+        "/".to_string()
+    } else if export.starts_with('/') {
+        export.trim_end_matches('/').to_string()
+    } else {
+        format!("/{}", export.trim_end_matches('/'))
+    };
+    let source = sh_quote(&format!("127.0.0.1:{export}"));
     let mut script = String::new();
     for c in mount_candidates(mount_point) {
         let mp = sh_quote(&c.display().to_string());
@@ -60,7 +90,7 @@ pub async fn mount(port: u16, mount_point: &Path) -> Result<PathBuf> {
         script.push_str(&format!(
             "mkdir -p {mp} && /sbin/mount_nfs -o \
              soft,nolocks,vers=3,tcp,rsize=131072,wsize=131072,retry=1,retrans=2,timeo=50,\
-             port={port},mountport={port} 127.0.0.1:/ {mp} && \
+             port={port},mountport={port} {source} {mp} && \
              {{ printf '{MOUNTED_MARKER}%s\\n' {mp}; exit 0; }}\n"
         ));
     }
