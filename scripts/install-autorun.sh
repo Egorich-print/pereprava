@@ -18,9 +18,24 @@ set -e
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
+# Plist values are XML text: escape the five predefined entities so paths
+# containing '&', '<', '>' or '"' cannot produce a corrupt/injected plist.
+xml_escape() {
+  print -r -- "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+                         -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+}
+
 echo "== building release binary =="
 cargo build --release -q
-BIN="$ROOT/target/release/pereprava"
+SRC_BIN="$ROOT/target/release/pereprava"
+
+# The LaunchDaemon runs as root, so it must NOT execute a binary from the
+# user's writable checkout: anything running as that user could replace the
+# file and obtain root execution on the next restart. Install a root-owned
+# copy under /usr/local/libexec and point the plist at it.
+PREFIX=/usr/local/libexec
+BIN="$PREFIX/pereprava"
+BIN_XML="$(xml_escape "$BIN")"
 
 PLIST=/Library/LaunchDaemons/com.egorich.pereprava.plist
 LOG=/var/log/pereprava.log
@@ -33,7 +48,7 @@ read -r -d '' XML <<EOF2 || true
     <key>Label</key><string>com.egorich.pereprava</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$BIN</string>
+        <string>$BIN_XML</string>
         <string>watch</string>
         <string>--port</string><string>34567</string>
         <string>--path</string><string>/Volumes/pereprava</string>
@@ -41,8 +56,8 @@ read -r -d '' XML <<EOF2 || true
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>ThrottleInterval</key><integer>10</integer>
-    <key>StandardOutPath</key><string>$LOG</string>
-    <key>StandardErrorPath</key><string>$LOG</string>
+    <key>StandardOutPath</key><string>$(xml_escape "$LOG")</string>
+    <key>StandardErrorPath</key><string>$(xml_escape "$LOG")</string>
 </dict>
 </plist>
 EOF2
@@ -51,8 +66,13 @@ TMP=$(mktemp)
 printf '%s\n' "$XML" > "$TMP"
 
 echo "== installing daemon (needs your password once) =="
+sudo mkdir -p "$PREFIX"
+sudo cp "$SRC_BIN" "$BIN"
+sudo chown root:wheel "$BIN"
+sudo chmod 0755 "$BIN"
 sudo cp "$TMP" "$PLIST"
 sudo chown root:wheel "$PLIST"
+sudo chmod 0644 "$PLIST"
 # Re-run safely: bootout first, then bootstrap the fresh definition.
 sudo launchctl bootout system/com.egorich.pereprava 2>/dev/null || true
 sudo launchctl bootstrap system "$PLIST" 2>/dev/null || \
@@ -60,6 +80,8 @@ sudo launchctl bootstrap system "$PLIST" 2>/dev/null || \
 rm -f "$TMP"
 
 echo "== building Tauri widget (Rust + Svelte) =="
+# A clean checkout has no ui/node_modules; vite is not on PATH otherwise.
+( cd "$ROOT/crates/widget/ui" && npm ci )
 ( cd "$ROOT/crates/widget" && cargo tauri build )
 
 echo "== installing widget (user agent, no sudo) =="
@@ -79,10 +101,12 @@ cat > "$WIDGET_PLIST" <<XML2
     <key>Label</key><string>com.egorich.pereprava.widget</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$APPS/Pereprava.app/Contents/MacOS/pereprava-widget</string>
+        <string>$(xml_escape "$APPS/Pereprava.app/Contents/MacOS/pereprava-widget")</string>
     </array>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
+    <!-- Restart on crash only: a clean exit (the tray "Выход") must stick. -->
+    <key>KeepAlive</key>
+    <dict><key>SuccessfulExit</key><false/></dict>
     <key>LimitLoadToSessionType</key><string>Aqua</string>
 </dict>
 </plist>

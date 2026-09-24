@@ -30,9 +30,10 @@ pub async fn run(
             .await
             .with_context(|| format!("binding NFS server on 127.0.0.1:{port}"))?;
     let mut listener = listener;
-    if allow_unprivileged_source_port {
-        listener.require_privileged_source_port(false);
-    }
+    // Require privileged source ports (the NFS model); the flag exists purely
+    // to relax this for the libnfs-based E2E harness, whose client cannot bind
+    // a privileged port. fernfs defaults to `false`, so set it explicitly.
+    listener.require_privileged_source_port(!allow_unprivileged_source_port);
     listener.with_export_name(&export);
     let server = tokio::spawn(async move {
         use pereprava_nfs::fernfs::tcp::NFSTcp;
@@ -49,11 +50,15 @@ pub async fn run(
         return Ok(());
     }
 
-    pereprava_nfs::mount(port, &path).await?;
+    // Retain the path actually mounted: the helper falls back to `-2`, `-3`, …
+    // when the requested point is occupied, and unmounting the original path
+    // would leave the real mount behind.
+    let used = pereprava_nfs::mount_export(port, &path, &export).await?;
 
     println!(
-        "mounted {} (read-only) — press Ctrl-C to unmount",
-        path.display()
+        "mounted {} ({}) — press Ctrl-C to unmount",
+        used.display(),
+        if read_only { "read-only" } else { "writable" }
     );
     println!("the volume should now appear in Finder");
     tokio::signal::ctrl_c()
@@ -61,10 +66,10 @@ pub async fn run(
         .context("waiting for Ctrl-C")?;
 
     println!("unmounting...");
-    if let Err(e) = pereprava_nfs::unmount(&path).await {
+    if let Err(e) = pereprava_nfs::unmount(&used).await {
         eprintln!(
-            "warning: unmount failed ({e}); run `sudo umount -f {:?}` manually",
-            path
+            "warning: unmount failed ({e}); run `sudo umount -f {}` manually",
+            used.display()
         );
     }
     dev.close().await.ok();
@@ -76,10 +81,25 @@ pub async fn run(
 ///
 /// Standalone helper for when `mount` was interrupted.
 pub async fn detach(path: PathBuf) -> Result<()> {
-    if !path.exists() {
-        bail!("{} does not exist", path.display());
+    // Do not gate on `exists()`: a stale NFS mount fails `stat` with ESTALE and
+    // `exists()` returns false for exactly the mounts we most need to detach.
+    // Try the requested point first, then the `-2`..`-9` fallbacks.
+    let mut candidates = vec![path.clone()];
+    candidates.extend(pereprava_nfs::mount_candidates(&path).into_iter().skip(1));
+    let mut last_err = None;
+    for candidate in candidates {
+        match pereprava_nfs::unmount(&candidate).await {
+            Ok(()) => {
+                if candidate != path {
+                    println!("unmounted {}", candidate.display());
+                }
+                return Ok(());
+            }
+            Err(e) => last_err = Some(e),
+        }
     }
-    pereprava_nfs::unmount(&path).await
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("no mounted volume found near {}", path.display())))
 }
 
 /// `watch` — keep the phone's volume alive across connect/disconnect cycles.
@@ -89,11 +109,17 @@ pub async fn detach(path: PathBuf) -> Result<()> {
 /// generation never changes, kernel filehandles survive every rotation and
 /// no additional admin prompts appear after the very first mount.
 #[allow(clippy::too_many_arguments)]
-pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) -> Result<()> {
+pub async fn watch(
+    path: PathBuf,
+    port: u16,
+    read_only: bool,
+    poll_secs: u64,
+    allow_unprivileged_source_port: bool,
+) -> Result<()> {
     let nfs =
         std::sync::Arc::new(MtpNfs::new_detached(!read_only).context("preparing the NFS adapter")?);
 
-    let listener = bind_nfs(port, &nfs).await?;
+    let listener = bind_nfs(port, &nfs, allow_unprivileged_source_port).await?;
     // A previous daemon generation can leave dead NFS mounts behind (base and
     // `-2`..`-9`); without this the new instance is pushed further out every
     // restart. We hold the port, so nothing we can see is serving them.
@@ -233,6 +259,7 @@ pub async fn watch(path: PathBuf, port: u16, read_only: bool, poll_secs: u64) ->
 async fn bind_nfs(
     port: u16,
     nfs: &std::sync::Arc<MtpNfs>,
+    allow_unprivileged_source_port: bool,
 ) -> Result<pereprava_nfs::fernfs::tcp::NFSTcpListener<pereprava_nfs::SharedMtpNfs>> {
     let mut warned = false;
     loop {
@@ -240,7 +267,11 @@ async fn bind_nfs(
         match pereprava_nfs::fernfs::tcp::NFSTcpListener::bind(&format!("127.0.0.1:{port}"), shared)
             .await
         {
-            Ok(listener) => return Ok(listener),
+            Ok(mut listener) => {
+                // Privileged source ports by default (fernfs ships `false`).
+                listener.require_privileged_source_port(!allow_unprivileged_source_port);
+                return Ok(listener);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 if !warned {
                     eprintln!(
@@ -331,7 +362,40 @@ fn is_alive_mount(path: &std::path::Path) -> bool {
     }
 }
 
-/// Writes the menu-bar status file atomically.
+/// Current wall-clock time in whole seconds, for status freshness checks.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// Escapes a string for embedding in a JSON string literal (RFC 8259).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Writes the menu-bar status file atomically and safely.
+///
+/// The daemon runs as root, so a predictable temp file in shared `/tmp` would
+/// let any local user pre-create it as a symlink and have the daemon truncate
+/// an arbitrary root-owned file. Instead:
+///   * the temp file is created in a `0700` directory owned by us,
+///   * with `create_new` (fails if the name already exists — no symlink
+///     following),
+///   * and carries entropy from pid + a monotonically increasing counter.
 fn write_status_file(
     state: &str,
     model: &str,
@@ -341,20 +405,93 @@ fn write_status_file(
     speed_rx: u64,
     speed_tx: u64,
 ) {
-    let esc = |s: &str| s.replace('"', "\\\"");
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let body = format!(
-        "{{\"state\":\"{}\",\"model\":\"{}\",\"mounted\":\"{}\",\"rx\":{},\"tx\":{},\"speed_rx\":{},\"speed_tx\":{}}}",
-        esc(state),
-        esc(model),
-        esc(mounted),
+        "{{\"state\":\"{}\",\"model\":\"{}\",\"mounted\":\"{}\",\"rx\":{},\"tx\":{},\"speed_rx\":{},\"speed_tx\":{},\"ts\":{}}}",
+        json_escape(state),
+        json_escape(model),
+        json_escape(mounted),
         rx,
         tx,
         speed_rx,
-        speed_tx
+        speed_tx,
+        unix_now_secs()
     );
+
     let dst = std::path::PathBuf::from("/tmp/pereprava-status.json");
-    let tmp = dst.with_extension("json.tmp");
-    if std::fs::write(&tmp, body).is_ok() {
-        drop(std::fs::rename(&tmp, &dst));
+    // A private staging directory keeps the create_new temp out of reach of
+    // other users; 0700 is set explicitly (create_dir_all honours umask).
+    let dir = std::path::PathBuf::from("/tmp/pereprava-status.d");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+            return;
+        }
+    }
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("{}-{n}", std::process::id()));
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    else {
+        return;
+    };
+    if f.write_all(body.as_bytes()).is_ok() && f.sync_all().is_ok() {
+        drop(f);
+        // Atomic replace; the public file is world-readable by design.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644));
+        }
+        if std::fs::rename(&tmp, &dst).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_escape_handles_control_and_quote_chars() {
+        assert_eq!(json_escape("a\"b"), "a\\\"b");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("\u{1}"), "\\u0001");
+    }
+
+    #[test]
+    fn status_json_is_parsable_after_escaping() {
+        // A device model containing a quote or backslash must not corrupt the
+        // snapshot: the widget parses this with a strict JSON reader. Every
+        // raw `"` inside the value must be escaped.
+        let model = "A\\065\"x";
+        let body = format!(
+            "{{\"state\":\"attached\",\"model\":\"{}\"}}",
+            json_escape(model)
+        );
+        assert_eq!(body, r#"{"state":"attached","model":"A\\065\"x"}"#);
+    }
+
+    #[test]
+    fn is_alive_mount_is_false_for_stale_paths() {
+        // A stale NFS mount errors on stat, so this must report false (the
+        // watcher then remounts). Use a definitely-stale, absent path.
+        assert!(!is_alive_mount(std::path::Path::new("/nonexistent-pv-xyz")));
     }
 }

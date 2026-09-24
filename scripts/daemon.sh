@@ -10,6 +10,10 @@
 LABEL=com.egorich.pereprava
 PLIST=/Library/LaunchDaemons/$LABEL.plist
 LOG=/var/log/pereprava.log
+# The daemon runs the root-owned copy, not the user-writable checkout.
+PREFIX=/usr/local/libexec
+BIN="$PREFIX/pereprava"
+SRC_BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/pereprava"
 
 case "${1:-status}" in
   stop)
@@ -20,6 +24,15 @@ case "${1:-status}" in
     ;;
   restart)
     sudo launchctl kickstart -k system/$LABEL && echo "daemon restarted"
+    ;;
+  update)
+    # Rebuild, refresh the root-owned binary, then bounce the service.
+    ( cd "$(dirname "$0")/.." && cargo build --release -q )
+    sudo mkdir -p "$PREFIX"
+    sudo cp "$SRC_BIN" "$BIN"
+    sudo chown root:wheel "$BIN"
+    sudo chmod 0755 "$BIN"
+    sudo launchctl kickstart -k system/$LABEL && echo "daemon updated + restarted"
     ;;
   status)
     if sudo launchctl print system/$LABEL 2>/dev/null | sed -n '1,14p'; then
@@ -32,7 +45,7 @@ case "${1:-status}" in
     tail -n "${2:-40}" "$LOG"
     ;;
   *)
-    echo "usage: $0 {stop|start|restart|status|log [n]}" >&2
+    echo "usage: $0 {stop|start|restart|update|status|log [n]}" >&2
     exit 2
     ;;
 esac
