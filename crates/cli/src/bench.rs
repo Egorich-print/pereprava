@@ -3,7 +3,7 @@
 //! Measures: big-file push/pull MiB/s, many-small-files push, directory
 //! listing latency. All artifacts are cleaned up afterwards.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -26,10 +26,13 @@ pub async fn run(params: Params) -> Result<()> {
 }
 
 async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Result<()> {
+    // Seconds alone collided between two runs started in the same second, and
+    // one run's cleanup could then delete the other run's data on the phone.
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or_default();
+    let stamp = format!("{stamp}-{}", std::process::id());
     let remote_base = format!("/1/pereprava-bench-{stamp}");
     let local_base: PathBuf = std::env::temp_dir().join(format!("pereprava-bench-{stamp}"));
     tokio::fs::create_dir_all(&local_base).await?;
@@ -41,6 +44,28 @@ async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Resu
     );
     println!("remote: {remote_base}");
 
+    // From here on every failure must still clean the phone, so the phases run
+    // in an inner call whose result is returned *after* an unconditional
+    // cleanup. Previously any `?` left the benchmark file and directory on the
+    // device.
+    let outcome = bench_phases(dev, &params, &remote_base, &local_base).await;
+
+    // --- Cleanup (always) ------------------------------------------------
+    drop(tokio::fs::remove_dir_all(&local_base).await);
+    match dev.remove(&remote_base, true).await {
+        Ok(n) => println!("cleanup: removed {n} remote object(s)"),
+        Err(e) => eprintln!("warning: remote cleanup failed ({e}); leftover at {remote_base}"),
+    }
+    outcome
+}
+
+/// Runs the measurement phases. All setup/cleanup lives in the caller.
+async fn bench_phases(
+    dev: &pereprava_core::DeviceHandle,
+    params: &Params,
+    remote_base: &str,
+    local_base: &Path,
+) -> Result<()> {
     let mut report = String::new();
 
     // --- Phase 1: single big file -------------------------------------
@@ -59,7 +84,7 @@ async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Resu
         let meta = tokio::fs::metadata(&big_local).await?;
         let f = tokio::fs::File::open(&big_local).await?;
         let t = Instant::now();
-        dev.upload_new(&remote_base, big_name, meta.len(), Box::new(f), silent())
+        dev.upload_new(remote_base, big_name, meta.len(), Box::new(f), silent())
             .await?;
         let ms = t.elapsed().as_millis();
         println!(
@@ -109,7 +134,7 @@ async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Resu
         }
 
         let t = Instant::now();
-        let stats = ops::push_tree(dev, &small_dir, &remote_base).await?;
+        let stats = ops::push_tree(dev, &small_dir, remote_base).await?;
         let ms = t.elapsed().as_millis();
         let ms_raw = ms; // kept for the bundle comparison
         let per_file = ms as f64 / f64::from(stats.files.max(1));
@@ -137,7 +162,7 @@ async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Resu
 
         // --- Phase 2b: same tree as one bundle (ADR-003 gate) ----------
         if params.bundle {
-            match crate::bundle::push_as_bundle(dev, &small_dir, &remote_base).await {
+            match crate::bundle::push_as_bundle(dev, &small_dir, remote_base).await {
                 Ok(b) => {
                     let bms = b.elapsed_ms.max(1);
                     println!(
@@ -159,13 +184,6 @@ async fn bench_inner(dev: &pereprava_core::DeviceHandle, params: Params) -> Resu
                 Err(e) => eprintln!("bundle phase failed: {e}"),
             }
         }
-    }
-
-    // --- Cleanup --------------------------------------------------------
-    drop(tokio::fs::remove_dir_all(&local_base).await);
-    match dev.remove(&remote_base, true).await {
-        Ok(n) => println!("cleanup: removed {n} remote object(s)"),
-        Err(e) => eprintln!("warning: remote cleanup failed ({e}); leftover at {remote_base}"),
     }
 
     println!(
