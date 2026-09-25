@@ -42,12 +42,68 @@ versioning follows [SemVer](https://semver.org/).
   fallback points; `--export` is passed to the mount source; the success
   message reports the real mode.
 
+### Fixed (v0.6 audit — device lifecycle)
+
+- **A wedged phone leaked its USB claim.** The storage probe ran in a spawned
+  task and, on timeout, only its receiver was dropped — the task kept the
+  `MtpDevice` and therefore the exclusive USB claim alive. Every later connect
+  then failed with "device is held exclusively by another process" until the
+  USB function was toggled by hand. The probe is now aborted on every
+  non-clean exit, which drops the device and releases the claim.
+- **`close()` reported success when nothing had been closed.** The actor's
+  teardown result was discarded, so a crashed or wedged actor still returned
+  `Ok(())`; it also had no deadline, so shutdown could hang the daemon forever
+  on an unresponsive phone. It now returns the real result, maps a dropped
+  receiver to `ActorClosed`, bounds the wait, aborts the actor on timeout, and
+  is idempotent.
+- **Handle-based delete invalidated the wrong directory.** `HDelete` guessed
+  the storage *root* instead of the directory the object was in, so a deleted
+  file stayed visible to `ls` for the length of the cache TTL. The cache now
+  records which directory each handle was listed from, and falls back to
+  dropping the whole storage when no listing ever revealed the parent.
+- **Device paths were parsed only after claiming the phone.** A malformed path
+  surfaced as "device is held exclusively by another process" — the device was
+  taken and released for an argument error that never needed it. `ls`, `pull`,
+  `push`, `mkdir`, `rm` and `mv` now validate up front, so bad input fails
+  immediately with the real reason.
+- `DevPath::parse` rejected `..` but let a bare `.` segment through to the
+  phone; both dot forms are now refused, as are control characters (NUL
+  cannot be represented in an MTP name at all).
+- `bench` left its test file and directory on the phone whenever a phase
+  failed, because cleanup only ran at the end; cleanup is now unconditional.
+  Its run id was whole seconds, so two runs in the same second shared a
+  directory and one's cleanup could delete the other's data — it now includes
+  nanoseconds and the pid.
+
+### Fixed (v0.6 audit — bundles)
+
+- `pack` walked with `metadata()`, which follows symlinks: a link inside the
+  source dragged an unrelated subtree into the archive and a link to an
+  ancestor walked forever. It now uses `symlink_metadata`, skips links and
+  special files explicitly (reporting how many), and cycle-checks directories
+  by inode with a depth bound.
+- `unpack` extracted straight into the destination, so any error left it
+  half-replaced with no way to tell what had changed. It now stages into a
+  private **sibling** directory and promotes atomically, restoring the
+  previous contents if promotion fails, and removes staging on every error.
+  Archive entries with absolute paths or `..` are rejected, and expanded size
+  and entry count are bounded so a small archive cannot fill the disk.
+- The two halves disagreed about symlinks: `pack` wrote link entries that
+  `unpack` silently dropped, and the written header had an empty size field
+  that made the archive unreadable by this same code. Bundles are file/dir
+  trees, so both halves now agree.
+
 ### Performance (v0.6)
 
 - NFS reads no longer issue an `hinfo` before every 128 KiB chunk; the range
   read goes first and metadata is fetched only on a short read or error. This
   removes half the per-chunk MTP round-trips and lifts sequential throughput
   through the mount from ~3.7 MB/s toward the ~37 MB/s data path.
+- `rsize`/`wsize` are negotiated at 1 MiB, matching the phone's `fsinfo`
+  transfer preference. Combined with the above, sequential reads through the
+  mounted volume went from **3.73 MB/s to 11.9 MB/s (3.2×)** — about 41% of the
+  29.0 MB/s direct-MTP reference lane on the same phone and cable. See
+  `docs/benchmarks/baseline.md`.
 
 ### Fixed (v0.6 audit — widget)
 
