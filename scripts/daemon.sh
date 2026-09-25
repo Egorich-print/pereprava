@@ -26,13 +26,21 @@ case "${1:-status}" in
     sudo launchctl kickstart -k system/$LABEL && echo "daemon restarted"
     ;;
   update)
-    # Rebuild, refresh the root-owned binary, then bounce the service.
+    # Rebuild, install the root-owned binary, repoint the plist at it, and
+    # reload the service (bootout+bootstrap, because launchd caches the job
+    # definition and a bare kickstart keeps using the old program path).
     ( cd "$(dirname "$0")/.." && cargo build --release -q )
     sudo mkdir -p "$PREFIX"
     sudo cp "$SRC_BIN" "$BIN"
     sudo chown root:wheel "$BIN"
     sudo chmod 0755 "$BIN"
-    sudo launchctl kickstart -k system/$LABEL && echo "daemon updated + restarted"
+    # The daemon must never run from the user-writable checkout.
+    sudo /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $BIN" "$PLIST" 2>/dev/null \
+      || sudo /usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string $BIN" "$PLIST"
+    sudo launchctl bootout system/$LABEL 2>/dev/null || true
+    sudo launchctl bootstrap system "$PLIST" 2>/dev/null \
+      || sudo launchctl load -w "$PLIST"
+    echo "daemon updated + restarted (now running $BIN)"
     ;;
   status)
     if sudo launchctl print system/$LABEL 2>/dev/null | sed -n '1,14p'; then
