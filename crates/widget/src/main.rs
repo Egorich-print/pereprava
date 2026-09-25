@@ -101,8 +101,9 @@ async fn unmount_mounted_async() -> Result<(), String> {
     let q = sh_quote(&path);
     // Plain umount first (clean detach), then -f, then diskutil for the
     // wedged-NFS cases the CLI relies on.
-    let script =
-        format!("/sbin/umount {q} 2>/dev/null || /sbin/umount -f {q} 2>/dev/null || /usr/sbin/diskutil unmount force {q}");
+    let script = format!(
+        "/sbin/umount {q} 2>/dev/null || /sbin/umount -f {q} 2>/dev/null || /usr/sbin/diskutil unmount force {q}"
+    );
     let escaped = script.replace('\\', "\\\\").replace('"', "\\\"");
     let out = tauri::async_runtime::spawn_blocking(move || {
         std::process::Command::new("/usr/bin/osascript")

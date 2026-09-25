@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/widget
@@ -51,6 +51,9 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Widget format check
+        working-directory: crates/widget
+        run: cargo fmt --check
       - name: Widget clippy
         working-directory: crates/widget
         run: cargo clippy --all-targets --locked -- -D warnings
