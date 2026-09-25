@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use pereprava_core::ops::{self, TreeStats};
+use pereprava_core::path::DevPath;
 use pereprava_core::{DeviceHandle, Entry, Progress, Resolved};
 use tokio::sync::watch;
 
@@ -92,7 +93,20 @@ pub async fn info() -> anyhow::Result<()> {
 }
 
 /// `ls` — list a directory (storages at `/`).
+/// Rejects a malformed device path *before* a USB session is opened.
+///
+/// Path parsing otherwise happens inside the actor, i.e. only after the phone
+/// has been claimed. A typo like `/1/./DCIM` then failed with "device is held
+/// exclusively by another process" — or, once validation was added, only after
+/// a pointless session was taken and released. Argument errors are cheap and
+/// must not disturb whatever owns the device.
+pub fn check_path(path: &str) -> anyhow::Result<()> {
+    DevPath::parse(path)?;
+    Ok(())
+}
+
 pub async fn ls(path: &str) -> anyhow::Result<()> {
+    check_path(path)?;
     with_device(|dev| async move {
         let entries: Vec<Entry> = dev.list(path, false).await?;
         if entries.is_empty() {
@@ -120,6 +134,7 @@ pub async fn ls(path: &str) -> anyhow::Result<()> {
 
 /// `pull` — download a file or a directory tree.
 pub async fn pull(remote: String, local: Option<String>) -> anyhow::Result<()> {
+    check_path(&remote)?;
     with_device(move |dev| async move {
         let resolved = dev.resolve(&remote).await?;
 
@@ -187,6 +202,7 @@ pub async fn pull(remote: String, local: Option<String>) -> anyhow::Result<()> {
 /// `force` is set (Android MTP answers GeneralError to duplicate names,
 /// so replacing means delete-then-upload).
 pub async fn push(local: String, remote: Option<String>, force: bool) -> anyhow::Result<()> {
+    check_path(remote.as_deref().unwrap_or("/1"))?;
     with_device(move |dev| async move {
         let remote_dir = remote.unwrap_or_else(|| "/1".to_string());
         ensure_parent_exists(&dev, &remote_dir).await?;
@@ -252,6 +268,7 @@ async fn ensure_parent_exists(dev: &DeviceHandle, remote_dir: &str) -> anyhow::R
 
 /// `mkdir` — create a directory including missing parents.
 pub async fn mkdir(path: String) -> anyhow::Result<()> {
+    check_path(&path)?;
     with_device(move |dev| async move {
         dev.mkdir_all(&path).await?;
         println!("created {path}");
@@ -262,6 +279,7 @@ pub async fn mkdir(path: String) -> anyhow::Result<()> {
 
 /// `rm` — delete an object (directories need `-r`).
 pub async fn rm(path: String, recursive: bool) -> anyhow::Result<()> {
+    check_path(&path)?;
     with_device(move |dev| async move {
         let n = dev.remove(&path, recursive).await?;
         println!("deleted {n} object(s): {path}");
@@ -272,6 +290,8 @@ pub async fn rm(path: String, recursive: bool) -> anyhow::Result<()> {
 /// `mv` — move into a directory, move+rename to a full path, or rename in
 /// place when the destination is a bare file name.
 pub async fn mv(from: String, to: String) -> anyhow::Result<()> {
+    check_path(&from)?;
+    check_path(&to)?;
     with_device(move |dev| async move {
         if let Ok(target) = dev.resolve(&to).await {
             if target.entry.is_dir {
@@ -372,6 +392,18 @@ fn is_same_parent(src: &Resolved, dst: &Resolved) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_paths_are_refused_before_any_device_access() {
+        // `check_path` is the only thing standing between a typo and claiming
+        // the phone, so it must reject everything the parser rejects.
+        for bad in ["/1/./DCIM", "/1/../etc", "/a/.", "/a/\u{0}b"] {
+            assert!(check_path(bad).is_err(), "`{bad}` must be refused");
+        }
+        for good in ["/1/DCIM", "/Internal shared storage/Camera", "/", ""] {
+            assert!(check_path(good).is_ok(), "`{good}` must be accepted");
+        }
+    }
 
     #[test]
     fn splits_parent_and_leaf() {
