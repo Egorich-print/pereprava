@@ -3,11 +3,9 @@
 /crates/widget/gen
 /crates/widget/ui/node_modules
 /crates/widget/ui/dist
-Cargo.lock.orig
 *.swp
 .DS_Store
 .idea/
 .vscode/
 *.log
 .env
-bench-out/

@@ -601,7 +601,6 @@ impl DeviceHandle {
     }
 
     /// Handle-based upload into `parent` directory.
-    #[allow(clippy::too_many_arguments)]
     pub async fn hupload(
         &self,
         storage_index: usize,
@@ -1214,7 +1213,6 @@ impl ActorState {
         Ok(n)
     }
 
-    #[allow(clippy::too_many_lines)] // depth-first delete with per-step accounting
     fn delete_tree<'a>(
         &'a mut self,
         idx: usize,
@@ -1245,7 +1243,6 @@ impl ActorState {
     ///
     /// Same parent => pure rename. Different parents => move_object then
     /// rename when the leaf name also changes.
-    #[allow(clippy::too_many_arguments)]
     async fn rename_handle(
         &mut self,
         idx: usize,
@@ -1430,7 +1427,6 @@ impl ActorState {
         Ok(written)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn upload_into(
         &mut self,
         idx: usize,

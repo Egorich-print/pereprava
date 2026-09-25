@@ -278,7 +278,6 @@ impl MtpNfs {
     /// Returns Err(NFS3ERR_PERM-equivalent IO) when the parent is itself
     /// virtual (unflushed) — nested creation inside unflushed dirs is not
     /// supported.
-    #[allow(clippy::type_complexity)]
     fn parent_handle_of(&self, dir_id: u64) -> Result<(usize, ObjectHandle), nfs3::nfsstat3> {
         match decode(dir_id) {
             Some(Kind::StorageRoot(idx)) => Ok((idx, ObjectHandle::ROOT)),

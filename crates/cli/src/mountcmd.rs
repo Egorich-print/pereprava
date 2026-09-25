@@ -20,7 +20,6 @@ const REQUIRE_PRIVILEGED_SOURCE_PORT: bool = false;
 ///
 /// With `serve_only` the NFS server runs without invoking `mount_nfs`
 /// (protocol debugging / tests that cannot gain root).
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     path: PathBuf,
     port: u16,
@@ -117,7 +116,6 @@ pub async fn detach(path: PathBuf) -> Result<()> {
 /// sessions rotate underneath (`MtpNfs::attach/detach`). Because the adapter
 /// generation never changes, kernel filehandles survive every rotation and
 /// no additional admin prompts appear after the very first mount.
-#[allow(clippy::too_many_arguments)]
 pub async fn watch(
     path: PathBuf,
     port: u16,

@@ -89,12 +89,12 @@ async fn bench_phases(
         let ms = t.elapsed().as_millis();
         println!(
             "push  {:>8} : {}",
-            human_size(big_len),
+            crate::format::human_bytes(big_len),
             crate::format::human_rate(big_len, ms)
         );
         report.push_str(&format!(
             "| big push | {} | {} |\n",
-            human_size(big_len),
+            crate::format::human_bytes(big_len),
             crate::format::human_rate(big_len, ms)
         ));
 
@@ -106,12 +106,12 @@ async fn bench_phases(
         let ms = t.elapsed().as_millis();
         println!(
             "pull  {:>8} : {}",
-            human_size(big_len),
+            crate::format::human_bytes(big_len),
             crate::format::human_rate(big_len, ms)
         );
         report.push_str(&format!(
             "| big pull | {} | {} |\n",
-            human_size(big_len),
+            crate::format::human_bytes(big_len),
             crate::format::human_rate(big_len, ms)
         ));
 
@@ -195,10 +195,6 @@ async fn bench_phases(
 
 fn silent() -> tokio::sync::watch::Sender<pereprava_core::Progress> {
     tokio::sync::watch::channel(pereprava_core::Progress { total: 0, done: 0 }).0
-}
-
-fn human_size(bytes: u64) -> String {
-    crate::format::human_bytes(bytes)
 }
 
 /// Writes `len` bytes of deterministic pseudo-random data; returns FNV-1a64.

@@ -619,7 +619,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "futures",
  "mtp-rs",
  "pereprava-core",
  "pereprava-nfs",

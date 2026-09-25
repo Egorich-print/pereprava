@@ -271,21 +271,8 @@ pub fn join_device(base: &str, leaf: &str) -> String {
     s
 }
 
-/// Convenience for callers that want a throwaway progress channel.
-#[must_use]
-pub fn silent_progress() -> (watch::Sender<Progress>, watch::Receiver<Progress>) {
-    watch::channel(Progress { total: 0, done: 0 })
-}
-
-/// Local path helper used by CLI to normalize destinations.
-#[must_use]
-pub fn ensure_unique_suffix(p: PathBuf) -> PathBuf {
-    // v0.1 keeps it simple: caller decides overwrite policy.
-    p
-}
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

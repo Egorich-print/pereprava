@@ -29,7 +29,6 @@ pub fn human_rate(bytes: u64, millis: u128) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
