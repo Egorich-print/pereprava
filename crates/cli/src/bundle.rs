@@ -155,10 +155,21 @@ fn pack_tar_zstd(src: &Path, dst: &Path) -> std::io::Result<(u32, u32, u64)> {
         files: 0,
         dirs: 0,
         raw: 0,
+        skipped: 0,
         visited: Vec::new(),
     };
     walk_add(&mut builder, src, src, 0, &mut st)?;
     builder.finish()?;
+    if st.skipped > 0 {
+        // Never silent: a bundle that quietly omits part of a tree looks like a
+        // successful backup.
+        eprintln!(
+            "warning: skipped {} symlink/special entr{} in {} (bundles hold files and directories)",
+            st.skipped,
+            if st.skipped == 1 { "y" } else { "ies" },
+            src.display()
+        );
+    }
     Ok((st.files, st.dirs, st.raw))
 }
 
@@ -171,6 +182,8 @@ struct WalkState {
     files: u32,
     dirs: u32,
     raw: u64,
+    /// Entries deliberately left out (symlinks, sockets, devices).
+    skipped: u32,
     /// Inodes of directories already entered, to detect aliasing cycles.
     visited: Vec<std::fs::Metadata>,
 }
@@ -214,14 +227,12 @@ fn walk_add(
         let meta = std::fs::symlink_metadata(&path)?;
         let ftype = meta.file_type();
         if ftype.is_symlink() {
-            // Bundles are file/dir trees by definition; record the link target
-            // instead of its contents so the archive stays self-consistent and
-            // cannot pull in an unrelated subtree.
-            let target = std::fs::read_link(&path)?;
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Symlink);
-            header.set_mode(0o777);
-            builder.append_link(&mut header, rel, target)?;
+            // Skipped, not stored and not dereferenced. Storing the link while
+            // the extractor ignores link entries made the two halves
+            // disagree, and extracting links from an untrusted archive lets a
+            // crafted bundle write *through* a link it planted (here or in the
+            // destination) into a directory it should not reach.
+            st.skipped += 1;
             continue;
         }
         if ftype.is_dir() {
@@ -234,6 +245,7 @@ fn walk_add(
             builder.append_path_with_name(&path, rel)?;
         } else {
             // Sockets/FIFOs/devices have no place in a bundle.
+            st.skipped += 1;
         }
     }
     st.visited.pop();
@@ -413,6 +425,40 @@ mod tests {
         assert_eq!((f2, r2), (2, 10));
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
         assert_eq!(std::fs::read(dest.join("sub/b.bin")).unwrap(), b"bravo");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `pack` and `unpack` must agree on what a bundle contains.
+    ///
+    /// Regression: `pack` emitted link entries while `unpack` skipped them, so
+    /// the archive this code wrote could not be read back by it.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_entries_roundtrip() {
+        let root = scratch("symrt");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/real.txt"), b"payload").unwrap();
+        std::os::unix::fs::symlink("sub/real.txt", src.join("rel.link")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", src.join("abs.link")).unwrap();
+
+        let arc = root.join("b.tar.zst");
+        let (files, dirs, _) = pack_tar_zstd(&src, &arc).expect("pack failed");
+        assert_eq!((files, dirs), (1, 1), "links are neither files nor dirs");
+
+        let dest = root.join("out");
+        let (f2, d2, _) = unpack_tar_zstd(&arc, &dest).expect("unpack must read its own archive");
+        assert_eq!((f2, d2), (1, 1), "pack and unpack must agree on contents");
+
+        // Never dereferenced: the absolute target must not have been copied in,
+        // and links are absent from both halves.
+        assert!(!dest.join("etc/passwd").exists());
+        assert!(!dest.join("abs.link").exists());
+        assert!(!dest.join("rel.link").exists());
+        assert_eq!(
+            std::fs::read(dest.join("sub/real.txt")).unwrap(),
+            b"payload"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
