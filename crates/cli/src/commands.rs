@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use pereprava_core::ops::{self, TreeStats};
-use pereprava_core::{DeviceHandle, Entry, Progress};
+use pereprava_core::{DeviceHandle, Entry, Progress, Resolved};
 use tokio::sync::watch;
 
 use crate::format::human_bytes;
@@ -302,7 +302,7 @@ pub async fn mv(from: String, to: String) -> anyhow::Result<()> {
         let src = dev.resolve(&from).await?;
         let dst_dir = dev.resolve(&parent).await?;
 
-        if dst_dir.handle == mtp_rs::ObjectHandle(src.entry.parent) {
+        if is_same_parent(&src, &dst_dir) {
             // Same directory: a pure rename (Android rejects no-op moves
             // with GeneralError, so don't even try move_object here).
             if src.entry.name != leaf {
@@ -349,6 +349,17 @@ fn report_tree(verb: &str, stats: &TreeStats, t0: Instant) {
     );
 }
 
+/// True when `dst` is the directory that already contains `src`.
+///
+/// MTP object handles are **storage-local**: every volume numbers its objects
+/// independently, so a directory on another storage can carry the exact same
+/// handle value as the source's parent. Comparing handles alone made a
+/// cross-storage `mv` take the "pure rename" branch and rename the file in its
+/// original directory instead of moving it.
+fn is_same_parent(src: &Resolved, dst: &Resolved) -> bool {
+    src.storage_index == dst.storage_index && dst.handle == mtp_rs::ObjectHandle(src.entry.parent)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -365,5 +376,43 @@ mod tests {
     #[test]
     fn storage_root_has_no_leaf() {
         assert!(split_device_parent_leaf("/storage").is_none());
+    }
+
+    fn resolved(storage_index: usize, handle: u64, parent: u64) -> Resolved {
+        Resolved {
+            storage_index,
+            handle: mtp_rs::ObjectHandle(handle),
+            entry: Entry {
+                handle,
+                parent,
+                name: "f.bin".into(),
+                is_dir: false,
+                size: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn same_directory_on_same_storage_is_detected() {
+        let src = resolved(0, 10, 7);
+        let dst = resolved(0, 7, 0);
+        assert!(is_same_parent(&src, &dst));
+    }
+
+    #[test]
+    fn identical_handles_on_different_storages_are_not_the_same_directory() {
+        // Regression: handles are storage-local, so handle 7 on storage 1 is an
+        // unrelated directory. Treating it as the source's parent renamed the
+        // file in place instead of moving it across volumes.
+        let src = resolved(0, 10, 7);
+        let dst = resolved(1, 7, 0);
+        assert!(!is_same_parent(&src, &dst));
+    }
+
+    #[test]
+    fn a_different_directory_on_the_same_storage_is_not_the_parent() {
+        let src = resolved(0, 10, 7);
+        let dst = resolved(0, 9, 0);
+        assert!(!is_same_parent(&src, &dst));
     }
 }
