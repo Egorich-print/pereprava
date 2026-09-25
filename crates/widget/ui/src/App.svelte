@@ -42,34 +42,24 @@
   const icon = $derived(
     attached ? (busy ? "🌉⇅" : "🌉") : gone ? "💤" : stale ? "⚠️" : "🚧",
   );
-  const headline = $derived(
+  const label = $derived(
     attached
       ? status.model || "телефон"
       : gone
-        ? "телефон отключён"
+        ? "отключён"
         : stale
-          ? "демон не отвечает"
+          ? "демон молчит"
           : "жду телефон",
   );
-  const subline = $derived(
-    attached
-      ? status.mounted
-        ? "том смонтирован"
-        : "том готовится…"
-      : gone
-        ? "настройки сохранены — подключите кабель"
-        : stale
-          ? "статус устарел — перезапустите демон"
-          : "кабель + режим «Передача файлов»",
-  );
-  // Actions need a live snapshot, not a stale mount path.
   const canAct = $derived(attached && !pending);
 
+  // Transfer speed shown prominently. Rates below 1 KiB/s keep one decimal so
+  // small transfers do not collapse to "0 KiB/s".
   function rate(bps) {
-    if (!bps) return "—";
-    if (bps < 1024) return `${bps} B/s`;
-    const mib = bps / (1024 * 1024);
-    return mib >= 1 ? `${mib.toFixed(1)} MiB/s` : `${(bps / 1024).toFixed(0)} KiB/s`;
+    if (!bps) return "0";
+    if (bps < 1024) return `${bps} B`;
+    if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(bps < 10240 ? 1 : 0)} KiB`;
+    return `${(bps / (1024 * 1024)).toFixed(1)} MiB`;
   }
 
   function size(bytes) {
@@ -99,37 +89,37 @@
 </script>
 
 <main class:attached>
-  <header>
-    <span class="brand">pereprava</span>
-    <span class="pill" class:on={attached} class:off={gone}>
-      {attached ? "подключено" : gone ? "оффлайн" : "ожидание"}
-    </span>
+  <!-- Drag anywhere in this strip to move the widget. -->
+  <header data-tauri-drag-region>
+    <span class="glyph" class:busy aria-hidden="true">{icon}</span>
+    <span class="title" data-tauri-drag-region>{label}</span>
+    <button class="pin" onclick={() => act("unmount_volume")} disabled={!canAct} title="Размонтировать">
+      {pending ? "…" : "⏏"}
+    </button>
   </header>
 
-  <section class="hero">
-    <div class="glyph" class:busy aria-hidden="true">{icon}</div>
-    <div class="who" aria-live="polite">
-      <h1>{headline}</h1>
-      <p>{subline}</p>
-    </div>
-  </section>
-
-  <section class="speeds">
-    <div class="card">
-      <span class="label">▼ скачивание</span>
+  <!-- Live transfer speed: the whole point of the widget. -->
+  <section class="speed" aria-live="polite">
+    <div class="dir down">
+      <span class="arrow">▼</span>
       <strong>{rate(status.speed_rx)}</strong>
-      <span class="total">всего {size(status.rx)}</span>
+      <span class="unit">/s</span>
     </div>
-    <div class="card">
-      <span class="label">▲ загрузка</span>
+    <div class="dir up">
+      <span class="arrow">▲</span>
       <strong>{rate(status.speed_tx)}</strong>
-      <span class="total">всего {size(status.tx)}</span>
+      <span class="unit">/s</span>
     </div>
   </section>
 
-  <section class="mount">
-    <span class="label">точка монтирования</span>
-    <code>{status.mounted || "—"}</code>
+  <div class="meter" aria-hidden="true">
+    <div class="meter-fill down" style:width={pct(status.speed_rx)}></div>
+    <div class="meter-fill up" style:width={pct(status.speed_tx)}></div>
+  </div>
+
+  <section class="foot">
+    <span class="totals">⇩ {size(status.rx)} · ⇧ {size(status.tx)}</span>
+    <span class="path">{status.mounted || "—"}</span>
   </section>
 
   {#if actionError}
@@ -137,182 +127,188 @@
   {/if}
 
   <section class="actions">
-    <button onclick={() => act("open_volume")} disabled={!canAct}>
-      Открыть том
-    </button>
-    <button class="ghost" onclick={() => act("unmount_volume")} disabled={!canAct}>
-      {pending ? "Выполняется…" : "Размонтировать"}
-    </button>
+    <button onclick={() => act("open_volume")} disabled={!canAct}>Открыть том</button>
   </section>
 </main>
 
+<script module>
+  // Bars saturate at 20 MiB/s (above the USB 2.0 ceiling) for a stable visual.
+  function pct(bps) {
+    return `${Math.min(100, (bps / (20 * 1024 * 1024)) * 100).toFixed(1)}%`;
+  }
+</script>
+
 <style>
+  :global(body) {
+    background: transparent !important;
+    overflow: hidden;
+  }
+
   main {
     height: 100%;
-    padding: 22px 20px 20px;
+    box-sizing: border-box;
+    padding: 10px 12px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
-    background:
-      radial-gradient(120% 80% at 100% 0%, rgba(74, 123, 247, 0.18), transparent 60%),
-      radial-gradient(120% 80% at 0% 100%, rgba(53, 208, 192, 0.14), transparent 55%),
-      var(--bg);
+    gap: 8px;
+    border-radius: 16px;
+    background: rgba(20, 26, 40, 0.88);
+    backdrop-filter: blur(18px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+    color: #e8eefc;
+    font-family:
+      -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
   }
 
   header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-  }
-
-  .brand {
-    font-weight: 700;
-    letter-spacing: 0.02em;
-  }
-
-  .pill {
-    font-size: 11px;
-    padding: 3px 10px;
-    border-radius: 999px;
-    background: var(--panel-2);
-    color: var(--muted);
-  }
-
-  .pill.on {
-    background: rgba(53, 208, 192, 0.16);
-    color: var(--accent);
-  }
-
-  .pill.off {
-    background: rgba(255, 107, 107, 0.14);
-    color: var(--danger);
-  }
-
-  .hero {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 18px;
-    border-radius: 16px;
-    background: var(--panel);
-    border: 1px solid rgba(255, 255, 255, 0.05);
+    gap: 8px;
   }
 
   .glyph {
-    font-size: 40px;
-    line-height: 1;
-    filter: grayscale(0.35) brightness(1.1);
-    transition: filter 0.2s ease;
+    font-size: 16px;
   }
 
-  .glyph.busy {
-    filter: none;
-  }
-
-  .who h1 {
-    margin: 0;
-    font-size: 20px;
-  }
-
-  .who p {
-    margin: 4px 0 0;
+  .title {
+    flex: 1;
     font-size: 12px;
-    color: var(--muted);
+    font-weight: 600;
+    color: #cddaf0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
-  .speeds {
+  .pin {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border-radius: 7px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.06);
+    color: #cddaf0;
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .pin:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+
+  .speed {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 12px;
+    gap: 8px;
   }
 
-  .card {
+  .dir {
     display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 14px;
-    border-radius: 14px;
-    background: var(--panel);
-    border: 1px solid rgba(255, 255, 255, 0.05);
+    align-items: baseline;
+    gap: 3px;
+    padding: 7px 9px;
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.05);
   }
 
-  .label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--muted);
-  }
-
-  .card strong {
-    font-size: 18px;
+  .dir strong {
+    font-size: 19px;
     font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
   }
 
-  .total {
-    font-size: 11px;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
+  .dir .arrow {
+    font-size: 10px;
   }
 
-  .mount {
+  .dir.down .arrow {
+    color: #35d0c0;
+  }
+
+  .dir.up .arrow {
+    color: #4a7bf7;
+  }
+
+  .unit {
+    font-size: 10px;
+    color: #8ea0c0;
+  }
+
+  .meter {
+    height: 3px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+  }
+
+  .meter-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.25s ease;
+  }
+
+  .meter-fill.down {
+    background: #35d0c0;
+  }
+
+  .meter-fill.up {
+    background: #4a7bf7;
+  }
+
+  .foot {
     display: flex;
-    flex-direction: column;
-    gap: 6px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 10px;
+    color: #8ea0c0;
   }
 
-  .mount code {
-    display: block;
-    padding: 10px 12px;
-    border-radius: 10px;
-    background: var(--panel);
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    font-size: 12px;
+  .totals {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .path {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--text);
+    /* Keep the path LTR; truncate at the end rather than reordering it. */
+    direction: ltr;
+    text-align: right;
   }
 
   .error {
     margin: 0;
-    padding: 10px 12px;
-    border-radius: 10px;
-    background: rgba(255, 107, 107, 0.12);
-    color: var(--danger);
-    font-size: 12px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    background: rgba(255, 107, 107, 0.15);
+    color: #ff8f8f;
+    font-size: 10px;
   }
 
   .actions {
     margin-top: auto;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
   }
 
-  button {
-    padding: 11px 14px;
-    border-radius: 11px;
-    border: 1px solid transparent;
-    background: linear-gradient(180deg, var(--accent), #24b3a6);
+  .actions button {
+    width: 100%;
+    padding: 6px 10px;
+    border-radius: 9px;
+    border: none;
+    background: linear-gradient(180deg, #35d0c0, #24b3a6);
     color: #06231f;
     font-weight: 600;
-    font-size: 13px;
+    font-size: 12px;
     cursor: pointer;
-    transition: opacity 0.15s ease, transform 0.05s ease;
   }
 
-  button.ghost {
-    background: var(--panel-2);
-    color: var(--text);
-    border-color: rgba(255, 255, 255, 0.08);
-  }
-
-  button:disabled {
-    opacity: 0.4;
+  .actions button:disabled {
+    opacity: 0.35;
     cursor: default;
-  }
-
-  button:not(:disabled):active {
-    transform: translateY(1px);
   }
 </style>

@@ -150,6 +150,35 @@ fn show_window(app: &AppHandle) {
     }
 }
 
+/// Parks the widget in the top-right corner of the primary monitor.
+///
+/// The widget is meant to stay on screen, so it must not land in the middle
+/// of the desktop or under the menu bar. Runs after the window exists.
+fn place_widget(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(monitor) = window.current_monitor() else {
+        return;
+    };
+    let Some(monitor) = monitor else { return };
+    let scale = monitor.scale_factor();
+    let size = window
+        .outer_size()
+        .map(|s| s.to_logical::<f64>(scale))
+        .map(|s| s.width)
+        .unwrap_or(330.0);
+    let screen = monitor.size().to_logical::<f64>(scale);
+    let origin = monitor.position().to_logical::<f64>(scale);
+    // 18 pt from the right edge, 56 pt below the top (clears the menu bar).
+    let x = origin.x + screen.width - size - 18.0;
+    let y = origin.y + 56.0;
+    let _ = window.set_position(tauri::PhysicalPosition::new(
+        (x * scale) as i32,
+        (y * scale) as i32,
+    ));
+}
+
 /// Quits the widget.
 ///
 /// The LaunchAgent is configured with `KeepAlive = { SuccessfulExit: false }`
@@ -219,11 +248,18 @@ fn main() {
                 })
                 .build(app)?;
 
-            // Push the watcher status to the UI once a second.
+            // Push the watcher status to the UI once a second, and keep the
+            // widget above other windows: macOS demotes a background (accessory)
+            // app's floating window when a normal app activates, so re-assert
+            // the level periodically.
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 loop {
                     let _ = handle.emit("status", read_status());
+                    if let Some(w) = handle.get_webview_window("main") {
+                        let _ = w.set_always_on_top(true);
+                        let _ = w.show();
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
             });
@@ -240,6 +276,17 @@ fn main() {
                     }
                 });
             }
+
+            // Park the always-on-top widget once the window is realized.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                // Give the webview a moment to apply its size before parking.
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let h = handle.clone();
+                if let Err(e) = handle.run_on_main_thread(move || place_widget(&h)) {
+                    eprintln!("could not place widget: {e}");
+                }
+            });
 
             Ok(())
         })

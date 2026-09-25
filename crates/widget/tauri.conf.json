@@ -11,15 +11,23 @@
   },
   "app": {
     "withGlobalTauri": false,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
         "title": "pereprava",
-        "width": 380,
-        "height": 540,
+        "width": 330,
+        "height": 230,
         "resizable": false,
         "maximizable": false,
-        "visible": false
+        "minimizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": true,
+        "focus": false
       }
     ],
     "security": {
