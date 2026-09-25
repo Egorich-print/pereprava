@@ -114,13 +114,28 @@ fn process_epoch_tag() -> u32 {
     })
 }
 
+/// Maps a core error onto an NFSv3 status.
+///
+/// The mapping is deliberately per-*condition* rather than "everything is IO":
+/// the kernel reacts very differently to `STALE` (forget the handle and
+/// re-look up), `ACCES`/`ROFS` (tell the user, do not retry), `NOSPC` (free
+/// space) and `IO` (transient). `Disconnected` and `SessionReset` stay `IO`
+/// so the `soft` mount simply fails the I/O instead of wedging.
 fn nfserr(e: pereprava_core::Error) -> nfs3::nfsstat3 {
     use pereprava_core::Error as E;
     match e {
         E::NotFound(_) => nfs3::nfsstat3::NFS3ERR_NOENT,
+        // Android re-keyed the object: the filehandle is dead, not the file.
+        E::StaleHandle(_) => nfs3::nfsstat3::NFS3ERR_STALE,
+        E::AccessDenied(_) => nfs3::nfsstat3::NFS3ERR_ACCES,
+        E::StorageFull(_) => nfs3::nfsstat3::NFS3ERR_NOSPC,
+        E::Unsupported(_) => nfs3::nfsstat3::NFS3ERR_NOTSUPP,
+        E::InvalidArgument(_) => nfs3::nfsstat3::NFS3ERR_INVAL,
+        // Generic fallback: callers that know the expected kind override this
+        // (e.g. a directory expected but a file found => ISDIR).
         E::WrongKind(_) => nfs3::nfsstat3::NFS3ERR_NOTDIR,
-        _ => {
-            tracing::debug!("mapping to IOERR: {e}");
+        other => {
+            tracing::debug!("mapping to IOERR: {other}");
             nfs3::nfsstat3::NFS3ERR_IO
         }
     }
@@ -615,15 +630,32 @@ impl MtpNfs {
     ///
     /// Must not use `info()`/`storages()` — the actor serves those from cached
     /// state and would keep reporting a phone that is no longer connected.
-    /// Bounded so a wedged USB transfer cannot freeze the watch loop.
+    /// Bounded so a wedged USB transfer cannot freeze the watch loop, and a
+    /// transient `Busy`/`Timeout` is *not* treated as a disconnect: dropping a
+    /// healthy session on one slow reply is what made the volume disappear.
     pub async fn test_session(&self) -> bool {
         let Some(dev) = self.inner.sess.read().ok().and_then(|g| g.clone()) else {
             return false;
         };
-        matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), dev.ping()).await,
-            Ok(Ok(()))
-        )
+        match tokio::time::timeout(std::time::Duration::from_secs(5), dev.ping()).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                if e.is_retryable() {
+                    tracing::debug!("ping busy/timeout, keeping session: {e}");
+                    true
+                } else if e.is_stale() {
+                    // The storage root handle moved; the session itself is fine.
+                    tracing::debug!("ping hit a stale handle, keeping session: {e}");
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => {
+                tracing::debug!("ping timed out after 5s, keeping session");
+                true
+            }
+        }
     }
 
     fn attr_for(&self, id: u64, is_dir: bool, size: u64) -> nfs3::fattr3 {
@@ -1283,6 +1315,57 @@ mod tests {
             decode(STORAGE_BASE_ID + 12345),
             Some(Kind::StorageRoot(12345))
         ));
+    }
+
+    #[test]
+    fn nfserr_maps_conditions_to_actionable_statuses() {
+        use pereprava_core::Error as E;
+        // A re-keyed handle must be STALE, not IO: the kernel must drop the
+        // filehandle and re-look-up, not retry the same dead handle forever.
+        assert_eq!(
+            nfserr(E::StaleHandle(String::new())),
+            nfs3::nfsstat3::NFS3ERR_STALE
+        );
+        assert_eq!(
+            nfserr(E::NotFound(String::new())),
+            nfs3::nfsstat3::NFS3ERR_NOENT
+        );
+        assert_eq!(
+            nfserr(E::AccessDenied(String::new())),
+            nfs3::nfsstat3::NFS3ERR_ACCES
+        );
+        assert_eq!(
+            nfserr(E::StorageFull(String::new())),
+            nfs3::nfsstat3::NFS3ERR_NOSPC
+        );
+        assert_eq!(
+            nfserr(E::Unsupported(String::new())),
+            nfs3::nfsstat3::NFS3ERR_NOTSUPP
+        );
+        assert_eq!(
+            nfserr(E::InvalidArgument(String::new())),
+            nfs3::nfsstat3::NFS3ERR_INVAL
+        );
+        assert_eq!(
+            nfserr(E::WrongKind(String::new())),
+            nfs3::nfsstat3::NFS3ERR_NOTDIR
+        );
+    }
+
+    #[test]
+    fn nfserr_keeps_transport_failures_as_io() {
+        use pereprava_core::Error as E;
+        // These must NOT look like "file is gone" or "disk full": the volume is
+        // temporarily unusable and the `soft` mount retries.
+        for e in [
+            E::Disconnected,
+            E::SessionReset,
+            E::Timeout,
+            E::Busy(String::new()),
+            E::Io(std::io::Error::other("boom")),
+        ] {
+            assert_eq!(nfserr(e), nfs3::nfsstat3::NFS3ERR_IO);
+        }
     }
 
     #[test]
