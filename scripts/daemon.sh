@@ -38,9 +38,25 @@ case "${1:-status}" in
     sudo /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $BIN" "$PLIST" 2>/dev/null \
       || sudo /usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string $BIN" "$PLIST"
     sudo launchctl bootout system/$LABEL 2>/dev/null || true
-    sudo launchctl bootstrap system "$PLIST" 2>/dev/null \
-      || sudo launchctl load -w "$PLIST"
-    echo "daemon updated + restarted (now running $BIN)"
+    # bootstrap can transiently fail while the previous instance is still
+    # tearing down; retry briefly, and never claim success we did not get.
+    ok=0
+    for attempt in 1 2 3 4 5; do
+      if sudo launchctl bootstrap system "$PLIST" 2>/dev/null; then
+        ok=1
+        break
+      fi
+      sleep 2
+    done
+    if [ "$ok" -ne 1 ] && sudo launchctl load -w "$PLIST" 2>/dev/null; then
+      ok=1
+    fi
+    if [ "$ok" -eq 1 ]; then
+      echo "daemon updated + restarted (now running $BIN)"
+    else
+      print -u2 "ERROR: failed to start the daemon; check: sudo $0 log 40"
+      exit 1
+    fi
     ;;
   status)
     if sudo launchctl print system/$LABEL 2>/dev/null | sed -n '1,14p'; then

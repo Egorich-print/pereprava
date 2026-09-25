@@ -67,7 +67,26 @@ struct Inner {
     staged: Mutex<HashMap<u64, Stage>>,
     virt_seq: Mutex<u64>,
     tmp_dir: PathBuf,
+    /// Short-lived metadata cache backing `getattr`.
+    ///
+    /// `fernfs` issues one to two GETATTR per NFS READ; when each of those
+    /// costs an MTP round-trip, a 128 KiB read costs three device requests
+    /// instead of one. Serving size/dir from here keeps the data path
+    /// dominant. Entries are dropped on every mutation and on session change,
+    /// and expire quickly so externally modified files converge.
+    attrs: Mutex<HashMap<u64, AttrCache>>,
 }
+
+/// Cached `(size, is_dir)` for a real object.
+struct AttrCache {
+    size: u64,
+    is_dir: bool,
+    at: std::time::Instant,
+}
+
+/// How long a cached attribute stays valid. Short enough that a file changed
+/// on the phone converges quickly, long enough to cover a sequential read.
+const ATTR_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Cheap clonable NFS view of one MTP device.
 #[derive(Clone)]
@@ -179,6 +198,7 @@ impl MtpNfs {
                 staged: Mutex::new(HashMap::new()),
                 virt_seq: Mutex::new(0),
                 tmp_dir,
+                attrs: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -512,6 +532,7 @@ impl MtpNfs {
             s.storage_index = p_idx;
             s.dirty = false;
             s.size = size;
+            self.attr_cache_clear();
         }
         Ok(())
     }
@@ -528,12 +549,43 @@ impl MtpNfs {
     pub async fn attach(&self, dev: DeviceHandle) -> Result<(), pereprava_core::Error> {
         let storages = dev.storages().await?;
         *self.inner.storages.write().await = storages;
+        // A new session can renumber storages/handles: cached attributes are
+        // no longer trustworthy.
+        self.attr_cache_clear();
         *self
             .inner
             .sess
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dev);
         Ok(())
+    }
+
+    fn attr_cache_get(&self, id: u64) -> Option<(u64, bool)> {
+        let st = self.inner.attrs.lock().ok()?;
+        let hit = st.get(&id)?;
+        if hit.at.elapsed() > ATTR_TTL {
+            return None;
+        }
+        Some((hit.size, hit.is_dir))
+    }
+
+    fn attr_cache_put(&self, id: u64, size: u64, is_dir: bool) {
+        if let Ok(mut st) = self.inner.attrs.lock() {
+            st.insert(
+                id,
+                AttrCache {
+                    size,
+                    is_dir,
+                    at: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+
+    fn attr_cache_clear(&self) {
+        if let Ok(mut st) = self.inner.attrs.lock() {
+            st.clear();
+        }
     }
 
     /// Drops the session (device gone). Staged files are kept on disk.
@@ -688,8 +740,12 @@ impl NFSFileSystem for MtpNfs {
                 }
             }
             Some(Kind::Real(d)) => {
+                if let Some((size, is_dir)) = self.attr_cache_get(id) {
+                    return Ok(self.attr_for(id, is_dir, size));
+                }
                 let dev = self.dev()?;
                 let info = dev.hinfo(d.storage_index, d.handle).await.map_err(nfserr)?;
+                self.attr_cache_put(id, info.size, info.is_dir);
                 Ok(self.attr_for(id, info.is_dir, info.size))
             }
             None => Err(nfs3::nfsstat3::NFS3ERR_BADHANDLE),
@@ -726,6 +782,7 @@ impl NFSFileSystem for MtpNfs {
                     .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
                 s.size = new_size;
                 s.dirty = true;
+                self.attr_cache_clear();
                 return Ok(self.attr_for(id, false, new_size));
             }
         }
@@ -863,6 +920,7 @@ impl NFSFileSystem for MtpNfs {
                 .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
             s.size = s.size.max(offset.saturating_add(data.len() as u64));
             s.dirty = true;
+            self.attr_cache_clear();
             let attr = self.attr_for(id, false, s.size);
             drop(st);
             // Data lives only in the local stage until COMMIT, so we must
@@ -959,6 +1017,7 @@ impl NFSFileSystem for MtpNfs {
                     st.remove(&stage_id);
                 }
                 drop(std::fs::remove_file(&tmp));
+                self.attr_cache_clear();
             }
             return Ok(());
         }
@@ -975,6 +1034,7 @@ impl NFSFileSystem for MtpNfs {
                 {
                     drop(std::fs::remove_file(&s.tmp));
                 }
+                self.attr_cache_clear();
                 Ok(())
             }
             None => Err(nfs3::nfsstat3::NFS3ERR_NOENT),
