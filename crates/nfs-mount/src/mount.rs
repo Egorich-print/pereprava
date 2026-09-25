@@ -87,9 +87,14 @@ pub async fn mount_export(port: u16, mount_point: &Path, export: &str) -> Result
         let mp = sh_quote(&c.display().to_string());
         // `soft` keeps a dead phone from wedging the volume permanently
         // (hard NFS + vanished USB = unkillable mount); retries stay modest.
+        //
+        // rsize/wsize are deliberately 1 MiB: each NFS READ is one MTP
+        // GetPartialObject transaction and Android's per-transaction overhead
+        // dominates at small sizes. The server advertises the same maximum
+        // (see `PREFERRED_IO_SIZE` in the adapter).
         script.push_str(&format!(
             "mkdir -p {mp} && /sbin/mount_nfs -o \
-             soft,nolocks,vers=3,tcp,rsize=131072,wsize=131072,retry=1,retrans=2,timeo=50,\
+             soft,nolocks,vers=3,tcp,rsize=1048576,wsize=1048576,retry=1,retrans=2,timeo=50,\
              port={port},mountport={port} {source} {mp} && \
              {{ printf '{MOUNTED_MARKER}%s\\n' {mp}; exit 0; }}\n"
         ));

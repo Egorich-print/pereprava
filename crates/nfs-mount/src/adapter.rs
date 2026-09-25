@@ -88,6 +88,13 @@ struct AttrCache {
 /// on the phone converges quickly, long enough to cover a sequential read.
 const ATTR_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Preferred NFS READ/WRITE size advertised in FSINFO.
+///
+/// One NFS READ maps to one MTP `GetPartialObject` transaction, and Android's
+/// per-transaction overhead dominates below this size; 1 MiB is also the
+/// server's advertised maximum, so there is no point going higher.
+const PREFERRED_IO_SIZE: u32 = 1024 * 1024;
+
 /// Cheap clonable NFS view of one MTP device.
 #[derive(Clone)]
 pub struct MtpNfs {
@@ -713,6 +720,22 @@ impl NFSFileSystem for MtpNfs {
         } else {
             Capabilities::ReadOnly
         }
+    }
+
+    /// Prefer large reads/writes.
+    ///
+    /// fernfs defaults to a 124 KiB *preferred* read size, and the mount was
+    /// configured with `rsize=131072`, so the kernel issued one 128 KiB NFS
+    /// READ — i.e. one MTP `GetPartialObject` transaction per 128 KiB. On
+    /// Android the per-command overhead dominates at that size. Advertising a
+    /// 1 MiB preference (still bounded by the client's `rsize`) cuts the
+    /// transaction count ~8x for the same data.
+    fn fsinfo_rtpref(&self) -> u32 {
+        PREFERRED_IO_SIZE
+    }
+
+    fn fsinfo_wtpref(&self) -> u32 {
+        PREFERRED_IO_SIZE
     }
 
     fn root_dir(&self) -> nfs3::fileid3 {
