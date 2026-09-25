@@ -749,11 +749,14 @@ impl ActorState {
                     Err(e) => Err(e),
                 };
                 if out.is_ok() {
-                    let sid = self
-                        .storage(storage_index)
-                        .map(|s| s.id.0 as u32)
-                        .unwrap_or(0);
-                    self.cache.invalidate(sid, 0);
+                    // Invalidate the directory the object actually lived in.
+                    // Invalidating the storage root instead left the listing
+                    // that still shows the deleted name fresh for LIST_TTL, so
+                    // `ls` right after a delete kept reporting a file that was
+                    // already gone.
+                    if let Ok(st) = self.storage(storage_index) {
+                        self.cache.invalidate_handle(st.id.0 as u32, handle.0);
+                    }
                 }
                 let _ = reply.send(out);
             }
