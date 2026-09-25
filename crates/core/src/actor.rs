@@ -29,6 +29,32 @@ const UPLOAD_CHUNK: usize = 256 * 1024;
 /// Upper bound on the initial storage probe of a USB candidate.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Upper bound on a graceful close. Past this the actor is considered wedged
+/// and is aborted, so a shutdown can never hang the daemon indefinitely.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits for the actor's teardown result and converts every non-clean ending
+/// into an error.
+///
+/// The distinction matters: the teardown result used to be discarded entirely,
+/// so a crashed or wedged actor still made `close()` return `Ok(())`, telling
+/// callers a clean session teardown had happened when none had. A dropped
+/// receiver means the actor task unwound (typically a panicking handler).
+async fn await_teardown(
+    rx: oneshot::Receiver<Result<()>>,
+    sent: bool,
+    limit: std::time::Duration,
+) -> Result<()> {
+    if !sent {
+        return Err(Error::ActorClosed);
+    }
+    match tokio::time::timeout(limit, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(Error::ActorClosed),
+        Err(_) => Err(Error::Timeout),
+    }
+}
+
 /// A storage volume as known to the actor.
 #[derive(Debug, Clone)]
 struct StorageRec {
@@ -167,7 +193,7 @@ enum Request {
 #[derive(Clone)]
 pub struct DeviceHandle {
     tx: mpsc::Sender<Request>,
-    finished: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>>,
+    finished: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<Result<()>>>>>,
     abort: tokio::task::AbortHandle,
 }
 
@@ -292,17 +318,17 @@ impl DeviceHandle {
         }
 
         let (tx, rx) = mpsc::channel::<Request>(16);
-        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
         let state = ActorState {
             device,
             storages,
             cache: MetaCache::new(),
         };
         let task = tokio::spawn(async move {
-            state.run(rx).await;
-            // Signal completion so `DeviceHandle::close` can await a clean
-            // session teardown even across process lifetimes.
-            let _ = done_tx.send(());
+            // If a request handler panics the task unwinds and this send never
+            // happens, so `close()` observes a dropped receiver and reports
+            // `ActorClosed` rather than a false success.
+            let _ = done_tx.send(state.run(rx).await);
         });
         Ok(Self {
             tx,
@@ -315,7 +341,7 @@ impl DeviceHandle {
     /// so a non-answering device cannot stall the candidate scan.
     async fn read_storages(device: MtpDevice) -> Result<(MtpDevice, Vec<StorageRec>)> {
         let (st_tx, st_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        let probe = tokio::spawn(async move {
             let mut storages = Vec::new();
             if let Ok(list) = device.storages().await {
                 for s in list {
@@ -331,11 +357,22 @@ impl DeviceHandle {
             }
             let _ = st_tx.send((device, storages));
         });
-        let (device, storages) = tokio::time::timeout(PROBE_TIMEOUT, st_rx)
-            .await
-            .map_err(|_| Error::Mtp("device did not answer the storage probe".into()))?
-            .map_err(|_| Error::ActorClosed)?;
-        Ok((device, storages))
+        match tokio::time::timeout(PROBE_TIMEOUT, st_rx).await {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(_)) => {
+                probe.abort();
+                Err(Error::ActorClosed)
+            }
+            Err(_) => {
+                // The probe owns the MtpDevice, and therefore the USB claim.
+                // Dropping the receiver alone left the wedged task alive: the
+                // abandoned claim then made every later connect attempt fail
+                // with "device is held exclusively". Aborting drops the device
+                // and releases it.
+                probe.abort();
+                Err(Error::Mtp("device did not answer the storage probe".into()))
+            }
+        }
     }
 
     /// Gracefully stops the actor and closes the MTP session.
@@ -347,15 +384,18 @@ impl DeviceHandle {
     /// # Errors
     /// Returns protocol errors from session close, if any.
     pub async fn close(&self) -> Result<()> {
-        self.tx
-            .send(Request::Shutdown)
-            .await
-            .map_err(|_| Error::ActorClosed)?;
-        let mut slot = self.finished.lock().await;
-        if let Some(rx) = slot.take() {
-            let _ = rx.await;
+        // Idempotent: a second close is a no-op rather than an error, and
+        // neither call can wait forever on a wedged actor.
+        let Some(rx) = self.finished.lock().await.take() else {
+            return Ok(());
+        };
+        let sent = self.tx.send(Request::Shutdown).await.is_ok();
+        let result = await_teardown(rx, sent, CLOSE_TIMEOUT).await;
+        if result.is_err() {
+            // The actor did not tear the session down; stop pretending it can.
+            self.force_close();
         }
-        Ok(())
+        result
     }
 
     /// Tears the actor task down without waiting for it.
@@ -629,7 +669,10 @@ struct ActorState {
 }
 
 impl ActorState {
-    async fn run(mut self, mut rx: mpsc::Receiver<Request>) {
+    /// Serves requests until shutdown, then closes the device session.
+    ///
+    /// The return value is the teardown outcome, reported to `close()`.
+    async fn run(mut self, mut rx: mpsc::Receiver<Request>) -> Result<()> {
         let mut running = true;
         while running {
             match rx.recv().await {
@@ -638,8 +681,14 @@ impl ActorState {
             }
         }
         tracing::debug!("actor: shutting down, closing device session");
-        if let Err(e) = self.device.close().await {
-            tracing::warn!("device close reported: {e}");
+        match self.device.close().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Reported, not fatal: the session is being torn down anyway and
+                // `close()` needs to know the close did not actually succeed.
+                tracing::warn!("device close reported: {e}");
+                Err(Error::Mtp(e.to_string()))
+            }
         }
     }
 
@@ -1538,4 +1587,58 @@ fn spawn_progress_ticker(
         }
     })
     .abort_handle()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn teardown_reports_the_actor_result() {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(()));
+        assert!(
+            await_teardown(rx, true, Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Err(Error::Mtp("close refused".into())));
+        assert!(
+            await_teardown(rx, true, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_does_not_fake_success() {
+        // A dropped receiver means the actor task unwound: a panicking handler
+        // must surface as an error, never as a clean close.
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        assert!(matches!(
+            await_teardown(rx, true, Duration::from_secs(1)).await,
+            Err(Error::ActorClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn teardown_is_bounded() {
+        // The shutdown request can never even be delivered.
+        let (_tx, rx) = oneshot::channel::<Result<()>>();
+        assert!(matches!(
+            await_teardown(rx, false, Duration::from_secs(1)).await,
+            Err(Error::ActorClosed)
+        ));
+
+        // And a wedged actor is bounded by the caller's deadline.
+        let (_tx, rx) = oneshot::channel::<Result<()>>();
+        assert!(matches!(
+            await_teardown(rx, true, Duration::from_millis(50)).await,
+            Err(Error::Timeout)
+        ));
+    }
 }
