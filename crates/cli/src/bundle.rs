@@ -151,37 +151,36 @@ fn pack_tar_zstd(src: &Path, dst: &Path) -> std::io::Result<(u32, u32, u64)> {
     let mut builder = tar::Builder::new(enc);
     builder.mode(tar::HeaderMode::Deterministic);
 
-    let mut files = 0u32;
-    let mut dirs = 0u32;
-    let mut raw = 0u64;
-    let mut visited = Vec::new();
-    walk_add(
-        &mut builder,
-        src,
-        src,
-        0,
-        &mut files,
-        &mut dirs,
-        &mut raw,
-        &mut visited,
-    )?;
+    let mut st = WalkState {
+        files: 0,
+        dirs: 0,
+        raw: 0,
+        visited: Vec::new(),
+    };
+    walk_add(&mut builder, src, src, 0, &mut st)?;
     builder.finish()?;
-    Ok((files, dirs, raw))
+    Ok((st.files, st.dirs, st.raw))
 }
 
 /// Depth guard for packing: every level recurses, so a pathological tree must
 /// not be able to exhaust the stack.
 const MAX_PACK_DEPTH: usize = 128;
 
+/// Mutable state threaded through the recursive pack walk.
+struct WalkState {
+    files: u32,
+    dirs: u32,
+    raw: u64,
+    /// Inodes of directories already entered, to detect aliasing cycles.
+    visited: Vec<std::fs::Metadata>,
+}
+
 fn walk_add(
     builder: &mut tar::Builder<impl Write>,
     root: &Path,
     dir: &Path,
     depth: usize,
-    files: &mut u32,
-    dirs: &mut u32,
-    raw: &mut u64,
-    visited: &mut Vec<std::fs::Metadata>,
+    st: &mut WalkState,
 ) -> std::io::Result<()> {
     if depth > MAX_PACK_DEPTH {
         return Err(std::io::Error::other(format!(
@@ -192,13 +191,13 @@ fn walk_add(
     // A directory that we have already entered (through a hard-linked alias or
     // a bind) would otherwise be walked forever.
     let here = std::fs::metadata(dir)?;
-    if visited.iter().any(|m| same_file(m, &here)) {
+    if st.visited.iter().any(|m| same_file(m, &here)) {
         return Err(std::io::Error::other(format!(
             "directory cycle detected at {}",
             dir.display()
         )));
     }
-    visited.push(here);
+    st.visited.push(here);
 
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
         .collect::<std::io::Result<Vec<std::fs::DirEntry>>>()?
@@ -226,18 +225,18 @@ fn walk_add(
             continue;
         }
         if ftype.is_dir() {
-            *dirs += 1;
+            st.dirs += 1;
             builder.append_dir(rel, &path)?;
-            walk_add(builder, root, &path, depth + 1, files, dirs, raw, visited)?;
+            walk_add(builder, root, &path, depth + 1, st)?;
         } else if ftype.is_file() {
-            *files += 1;
-            *raw += meta.len();
+            st.files += 1;
+            st.raw += meta.len();
             builder.append_path_with_name(&path, rel)?;
         } else {
             // Sockets/FIFOs/devices have no place in a bundle.
         }
     }
-    visited.pop();
+    st.visited.pop();
     Ok(())
 }
 
