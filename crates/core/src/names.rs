@@ -44,4 +44,25 @@ mod tests {
         assert!(names_eq("DCIM", "DCIM"));
         assert!(names_eq_ci("dcim", "DCIM"));
     }
+
+    #[test]
+    fn case_folding_covers_non_ascii() {
+        // The ASCII fast path must not become the only path: these pairs differ
+        // outside ASCII, and a phone vs macOS disagree exactly here.
+        assert!(names_eq_ci("Ёлка", "ёлка"));
+        assert!(names_eq_ci("ПАПКА", "папка"));
+        assert!(names_eq_ci("ÄÖÜ", "äöü"));
+        assert!(names_eq_ci("ΣΊΣΥΦΟΣ", "σίσυφος"));
+        assert!(!names_eq_ci("DCIM", "Downloads"));
+    }
+
+    #[test]
+    fn case_and_normalization_compose() {
+        // Both axes at once: macOS hands over NFD, the phone reports NFC, and
+        // the casing differs too.
+        let phone = "Ёлка";
+        let mac: String = "ёлка".nfd().collect();
+        assert_ne!(phone, mac);
+        assert!(names_eq_ci(phone, &mac));
+    }
 }

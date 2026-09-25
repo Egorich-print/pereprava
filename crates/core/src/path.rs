@@ -33,14 +33,24 @@ impl DevPath {
         }
 
         for p in &parts {
-            if *p == ".." {
+            // Both dot forms are rejected rather than normalized: collapsing
+            // them would change what the user asked for, and passing `.`
+            // through to the phone asks it to resolve a segment we should own.
+            if *p == ".." || *p == "." {
                 return Err(crate::error::Error::InvalidArgument(format!(
-                    "`..` is not allowed in device paths: {input}"
+                    "`{p}` is not allowed in device paths: {input}"
                 )));
             }
             if p.trim().is_empty() {
                 return Err(crate::error::Error::InvalidArgument(format!(
                     "empty path segment in {input}"
+                )));
+            }
+            // A NUL cannot be represented in an MTP name at all, and control
+            // characters have no legitimate use in one.
+            if p.chars().any(|c| c.is_control()) {
+                return Err(crate::error::Error::InvalidArgument(format!(
+                    "control character in path segment `{p}` of {input}"
                 )));
             }
         }
@@ -107,6 +117,27 @@ mod tests {
             DevPath::parse("/a/../b"),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn rejects_dot_segment() {
+        // `.` used to be passed through to the phone to resolve.
+        for raw in ["/a/./b", "/./a", "/a/."] {
+            assert!(
+                matches!(DevPath::parse(raw), Err(Error::InvalidArgument(_))),
+                "`{raw}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        for raw in ["/a/\u{0}b", "/a/line\nbreak"] {
+            assert!(
+                matches!(DevPath::parse(raw), Err(Error::InvalidArgument(_))),
+                "`{raw}` must be rejected"
+            );
+        }
     }
 
     #[test]
