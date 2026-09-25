@@ -338,6 +338,16 @@ impl MtpNfs {
         }
         out.sync_all().map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
         drop(out);
+        // The stage must actually contain what we are going to claim. A short
+        // device read used to be recorded as the original size, so the next
+        // COMMIT uploaded a truncated object under a full-length name.
+        let staged_len = std::fs::metadata(&tmp)
+            .map(|m| m.len())
+            .map_err(|_| nfs3::nfsstat3::NFS3ERR_IO)?;
+        if staged_len != size {
+            drop(std::fs::remove_file(&tmp));
+            return Err(nfs3::nfsstat3::NFS3ERR_IO);
+        }
         let mut st = self
             .inner
             .staged

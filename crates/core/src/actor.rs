@@ -1366,6 +1366,15 @@ impl ActorState {
             });
         }
         writer.flush().await?;
+
+        // A stream that ends early is a failed transfer, not a small file:
+        // accepting it silently produced a truncated local file and reported
+        // success (and `pull_tree` counted it as transferred).
+        if written != total {
+            return Err(Error::Mtp(format!(
+                "short read: device reported {total} bytes, stream delivered {written}"
+            )));
+        }
         Ok(written)
     }
 
@@ -1389,7 +1398,7 @@ impl ActorState {
             inner: reader,
             counter: Arc::clone(&counter),
         };
-        let ticker = spawn_progress_ticker(counter, size, progress);
+        let ticker = spawn_progress_ticker(Arc::clone(&counter), size, progress);
 
         let data: Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + '_>> =
             Box::pin(futures::stream::unfold(
@@ -1449,6 +1458,22 @@ impl ActorState {
             }
         };
         ticker.abort();
+
+        // The declared size is the contract with the device. If the stream
+        // delivered a different number of bytes, the object on the phone
+        // disagrees with its own metadata, so remove it instead of leaving a
+        // corrupt file behind. (The size comes from a `stat` taken before the
+        // read, so a file changing underneath us shows up exactly here.)
+        let delivered = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if delivered != size {
+            tracing::warn!(
+                "upload size mismatch (declared {size}, sent {delivered}); deleting {uploaded:?}"
+            );
+            drop(storage.delete(uploaded).await);
+            return Err(Error::Mtp(format!(
+                "short upload: declared {size} bytes, stream delivered {delivered}"
+            )));
+        }
 
         let sid = self.storage(idx)?.id.0 as u32;
         self.cache.invalidate(sid, parent.0);
