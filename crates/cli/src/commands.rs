@@ -347,6 +347,14 @@ fn report_tree(verb: &str, stats: &TreeStats, t0: Instant) {
         human_bytes(stats.bytes),
         t0.elapsed().as_secs_f64()
     );
+    // A silently incomplete transfer must not be reported as a clean success.
+    if stats.skipped > 0 {
+        println!(
+            "warning: {} item(s) skipped (symlinks, special files, unsafe or \
+             non-representable names) — the result is incomplete",
+            stats.skipped
+        );
+    }
 }
 
 /// True when `dst` is the directory that already contains `src`.
