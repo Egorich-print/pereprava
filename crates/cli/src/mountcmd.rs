@@ -7,6 +7,15 @@ use anyhow::{Context, Result, bail};
 use pereprava_core::DeviceHandle;
 use pereprava_nfs::MtpNfs;
 
+/// Whether the NFS listener must reject clients with a non-privileged
+/// source port.
+///
+/// **Must stay `false`.** macOS `mount_nfs` always connects from an ephemeral
+/// (>= 1024) port, and fernfs drops any such peer when this is enabled
+/// (`vendor/fernfs/src/tcp.rs`), which makes every mount hang. Turning it on
+/// "for correctness" per RFC 1813 broke mounting on this machine.
+const REQUIRE_PRIVILEGED_SOURCE_PORT: bool = false;
+
 /// Mounts the connected device at `path` and serves until Ctrl-C.
 ///
 /// With `serve_only` the NFS server runs without invoking `mount_nfs`
@@ -30,10 +39,10 @@ pub async fn run(
             .await
             .with_context(|| format!("binding NFS server on 127.0.0.1:{port}"))?;
     let mut listener = listener;
-    // Require privileged source ports (the NFS model); the flag exists purely
-    // to relax this for the libnfs-based E2E harness, whose client cannot bind
-    // a privileged port. fernfs defaults to `false`, so set it explicitly.
-    listener.require_privileged_source_port(!allow_unprivileged_source_port);
+    // Unprivileged source ports are REQUIRED here (see the constant).
+    // The flag is accepted for CLI compatibility but cannot change this.
+    let _ = allow_unprivileged_source_port;
+    listener.require_privileged_source_port(REQUIRE_PRIVILEGED_SOURCE_PORT);
     listener.with_export_name(&export);
     let server = tokio::spawn(async move {
         use pereprava_nfs::fernfs::tcp::NFSTcp;
@@ -268,8 +277,9 @@ async fn bind_nfs(
             .await
         {
             Ok(mut listener) => {
-                // Privileged source ports by default (fernfs ships `false`).
-                listener.require_privileged_source_port(!allow_unprivileged_source_port);
+                // Unprivileged source ports are required (see the constant).
+                let _ = allow_unprivileged_source_port;
+                listener.require_privileged_source_port(REQUIRE_PRIVILEGED_SOURCE_PORT);
                 return Ok(listener);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -493,5 +503,26 @@ mod tests {
         // A stale NFS mount errors on stat, so this must report false (the
         // watcher then remounts). Use a definitely-stale, absent path.
         assert!(!is_alive_mount(std::path::Path::new("/nonexistent-pv-xyz")));
+    }
+
+    /// Regression guard: the strict privileged-source-port mode must never be
+    /// turned on, because the macOS NFS client cannot satisfy it.
+    #[test]
+    fn nfs_listener_allows_ephemeral_source_ports() {
+        // Every listener must be configured through the constant, never a
+        // literal `true`.
+        let src = include_str!("mountcmd.rs");
+        let test_start = src.find("mod tests").expect("tests module");
+        let prod = &src[..test_start];
+        assert!(
+            !prod.contains("require_privileged_source_port(true)"),
+            "strict mode must never be enabled; use the constant"
+        );
+        assert_eq!(
+            prod.matches("require_privileged_source_port(REQUIRE_PRIVILEGED_SOURCE_PORT)")
+                .count(),
+            2,
+            "both the one-shot mount and the watcher must use the constant"
+        );
     }
 }
