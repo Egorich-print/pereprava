@@ -619,6 +619,30 @@ impl MtpNfs {
         }
     }
 
+    /// Collects a device listing into the attribute cache.
+    ///
+    /// A listing already carries `size` and `is_dir` for every child, and the
+    /// kernel follows a `readdir` with a `getattr` per entry. Without seeding
+    /// here, browsing a directory of N files cost N extra MTP round trips:
+    /// `DCIM/Camera` (3873 entries) took ~24 s and Finder gave up with
+    /// "the network connection was interrupted". Seeding turns that into zero
+    /// extra calls — the `getattr` storm is served from memory.
+    fn seed_attrs(&self, children: impl Iterator<Item = (u64, bool, u64)>) {
+        if let Ok(mut st) = self.inner.attrs.lock() {
+            let now = std::time::Instant::now();
+            for (id, is_dir, size) in children {
+                st.insert(
+                    id,
+                    AttrCache {
+                        size,
+                        is_dir,
+                        at: now,
+                    },
+                );
+            }
+        }
+    }
+
     /// Drops the session (device gone). Staged files are kept on disk.
     ///
     /// The old actor is force-closed: the caller only reaches this path after
@@ -1193,13 +1217,25 @@ impl NFSFileSystem for MtpNfs {
             }
             Some(Kind::StorageRoot(idx)) => {
                 let dev = self.dev()?;
-                for e in dev.hlist(idx, ObjectHandle::ROOT).await.map_err(nfserr)? {
+                let entries = dev.hlist(idx, ObjectHandle::ROOT).await.map_err(nfserr)?;
+                self.seed_attrs(
+                    entries
+                        .iter()
+                        .map(|e| (encode_real(idx, e.handle), e.is_dir, e.size)),
+                );
+                for e in entries {
                     children.push((encode_real(idx, e.handle), e.name.clone(), e.is_dir, e.size));
                 }
             }
             Some(Kind::Real(d)) => {
                 let dev = self.dev()?;
-                for e in dev.hlist(d.storage_index, d.handle).await.map_err(nfserr)? {
+                let entries = dev.hlist(d.storage_index, d.handle).await.map_err(nfserr)?;
+                self.seed_attrs(
+                    entries
+                        .iter()
+                        .map(|e| (encode_real(d.storage_index, e.handle), e.is_dir, e.size)),
+                );
+                for e in entries {
                     children.push((
                         encode_real(d.storage_index, e.handle),
                         e.name.clone(),

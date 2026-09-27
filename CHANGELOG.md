@@ -6,6 +6,37 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (v0.6 — large-directory browsing hung Finder)
+
+Browsing a large folder reported "the network connection was interrupted".
+`DCIM/Camera` (3873 entries) on the test device:
+
+| Operation | Before | After |
+|---|---|---|
+| first `readdir` | 24 s | 15 s |
+| repeat within the cache TTL | 1 s | 0 s |
+| repeat after a 20 s pause | 15 s | 1 s |
+
+- **The attribute cache was only ever filled by the very call it exists to
+  avoid.** `getattr` fetched each object's metadata with its own `hinfo` round
+  trip and cached the result, but a device listing already carries `size` and
+  `is_dir` for every child and that information was thrown away. Since the
+  kernel follows a `readdir` with a `getattr` per entry, opening a folder of N
+  files cost N extra MTP round trips — 3873 of them for `DCIM/Camera`. Listings
+  now seed the cache, so that storm is served from memory.
+- **The listing TTL was 10 s, shorter than a human pause.** Every mutation this
+  codebase performs already invalidates the affected listing immediately, so the
+  TTL only bounded how long a change made *on the phone* went unnoticed — yet
+  nearly every directory view missed the cache and paid the full enumeration
+  again. Raised to 60 s, which keeps a browsing session warm.
+
+The remaining first-read cost is the phone itself: mtp-rs enumerates a folder
+with one `GetObjectInfo` per object (~5 ms each), so 3873 entries is ~19 s with
+no NFS involved. Confirmed by timing the raw CLI listing, which is identical.
+A bulk `GetObjectPropList` would avoid it, but mtp-rs exposes only the operation
+code, not a builder — that is a hand-written PTP transaction, deliberately not
+attempted here.
+
 ### Removed (dead code and build hygiene)
 
 A four-way audit (repository hygiene, Rust crates, documentation, scripts/CI)

@@ -10,7 +10,19 @@ use std::time::{Duration, Instant};
 use crate::model::Entry;
 
 /// How long a directory listing stays fresh.
-pub const LIST_TTL: Duration = Duration::from_secs(10);
+///
+/// Every mutation this codebase performs invalidates the affected listing
+/// immediately (see the `cache.invalidate*` call sites in the actor), so the
+/// TTL only bounds how long a change made *on the phone* — a camera app saving
+/// a new file — goes unnoticed.
+///
+/// It has to be comfortably longer than a human pause. Enumerating a large
+/// folder costs one MTP round trip per object, and `DCIM/Camera` on the test
+/// device (3873 entries) takes ~19 s to enumerate. At the previous 10 s, almost
+/// every directory view missed the cache and paid that again: browsing the same
+/// folder cost 18 s cold, 1 s warm, 15 s after a 15 s pause. A minute keeps a
+/// browsing session warm while still bounding external staleness sensibly.
+pub const LIST_TTL: Duration = Duration::from_secs(60);
 
 /// Upper bound on live listings kept per storage. Expired entries are pruned
 /// on every store; this cap protects a long-lived process from unbounded
