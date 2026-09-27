@@ -96,6 +96,9 @@
     <button class="pin" onclick={() => act("unmount_volume")} disabled={!canAct} title="Размонтировать">
       {pending ? "…" : "⏏"}
     </button>
+    <!-- Frameless window: macOS gives us no close button, so the widget needs
+         its own. Hides only; the tray icon brings it back. -->
+    <button class="close" onclick={() => act("hide_widget")} title="Скрыть виджет">×</button>
   </header>
 
   <!-- Live transfer speed: the whole point of the widget. -->
@@ -198,6 +201,24 @@
   .pin:disabled {
     opacity: 0.3;
     cursor: default;
+  }
+
+  .close {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border-radius: 7px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.06);
+    color: #8ea0c0;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .close:hover {
+    color: #ff8f8f;
+    background: rgba(255, 107, 107, 0.15);
   }
 
   .speed {

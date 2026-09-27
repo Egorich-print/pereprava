@@ -143,6 +143,17 @@ async fn unmount_volume() -> Result<(), String> {
     unmount_mounted_async().await
 }
 
+/// Hides the widget without quitting.
+///
+/// The window is frameless, so macOS gives it no close button and the user has
+/// nothing to click. This is that affordance: the tray icon brings it back.
+#[tauri::command]
+fn hide_widget(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
 fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -194,7 +205,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             open_volume,
-            unmount_volume
+            unmount_volume,
+            hide_widget
         ])
         .setup(|app| {
             // Menu-bar app: no Dock icon.
@@ -253,13 +265,16 @@ fn main() {
             // widget above other windows: macOS demotes a background (accessory)
             // app's floating window when a normal app activates, so re-assert
             // the level periodically.
+            //
+            // Deliberately does NOT call `show()`. Doing so resurrected the
+            // window every second, which made it impossible to dismiss: the
+            // close handler hid it and this brought it straight back.
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 loop {
                     let _ = handle.emit("status", read_status());
                     if let Some(w) = handle.get_webview_window("main") {
                         let _ = w.set_always_on_top(true);
-                        let _ = w.show();
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
